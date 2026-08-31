@@ -11,7 +11,7 @@ mod formats;
 mod output;
 mod pipeline;
 pub mod platesolving;
-mod processing;
+pub mod processing;
 mod types;
 
 pub use analysis::{

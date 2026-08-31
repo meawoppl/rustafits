@@ -14,6 +14,12 @@
 //! `centre + (mean of colour c) − (mean of the centre's colour)`, a difference of
 //! means that cancels the interpolation bias common to both.
 //!
+//! An earlier form averaged a fixed arm of offsets per direction. It is provably
+//! identical to the above at red and blue sites — each arm reduces to exactly
+//! these samples — so it is not a cheaper spelling of the same thing: it differs
+//! only at green sites, and there it measured worse against the external
+//! reference (plane 0 corr 0.9947 vs 0.9968, p99.9 2.9e-3 vs 1.2e-3).
+//!
 //! Unlike [`super::debayer::super_pixel_debayer_f32`] this keeps the native
 //! pixel grid: the output is a full-resolution planar RGB buffer.
 //!

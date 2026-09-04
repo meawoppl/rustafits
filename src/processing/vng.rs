@@ -25,8 +25,17 @@
 //!
 //! Validated against an external reference implementation's VNG output for the
 //! same calibrated CFA frame by `vng_matches_reference_debayer` below.
+//!
+//! The interior pass (this module's hot loop) is parallelized with rayon over
+//! horizontal row bands, each computed by [`interior_pixel_rgb`] — the single
+//! per-pixel function both the parallel loop and the `#[cfg(test)]` serial
+//! reference call, so splitting rows across threads changes only which core
+//! writes a pixel, never the arithmetic that produces its value, keeping the
+//! output bit-identical to a fully serial run; the O(width+height) border pass
+//! ([`bilinear_border`]) stays serial.
 
 use crate::types::BayerPattern;
+use rayon::prelude::*;
 
 /// Unit vectors of the eight directions: the four axial ones first, then the four
 /// diagonals. They are both the gradient directions and the offsets of the eight
@@ -49,6 +58,14 @@ const FIRST_DIAGONAL: usize = 4;
 
 /// Sample pairs per direction whose absolute differences form its gradient.
 const GRADIENT_TERMS: usize = 6;
+
+/// Row-band height for the parallel interior pass. Each band is one rayon
+/// task, so it must comfortably clear task-dispatch overhead (kept well above
+/// the 32-row floor); at the same time a 26 MP frame (4176 rows) still splits
+/// into ~65 bands, several times the machine's 10 cores, so rayon's work
+/// stealing can even out the 4-performance/6-efficiency core split without
+/// hand-tuning per-core weights.
+const BAND_ROWS: usize = 64;
 
 /// The first two gradient terms carry full weight, the remaining four a half
 /// weight — they sit one pixel off the direction's own axis.
@@ -152,23 +169,51 @@ pub fn vng_debayer_f32(
 
     let terms = gradient_terms();
 
-    for y in 2..y_hi {
-        for x in 2..x_hi {
-            let rgb = interior_pixel_rgb(data, width, height, &colors, &terms, x, y);
-            let center = y * width + x;
-            for c in 0..3 {
-                out[c * plane + center] = rgb[c];
-            }
-        }
+    // Split the interior rows [2, y_hi) out of all three planes and hand each
+    // plane's row bands to rayon in lock-step (`zip`), so every band writes
+    // disjoint mutable slices of R, G and B — no `unsafe`, no `Mutex`. Each
+    // pixel only reads `data` (shared, immutable) and calls
+    // `interior_pixel_rgb`, so which thread computes which band cannot change
+    // a single output value.
+    let interior_rows = y_hi.saturating_sub(2);
+    if interior_rows > 0 {
+        let row_lo = 2 * width;
+        let row_hi = y_hi * width;
+        let (r_plane, rest) = out.split_at_mut(plane);
+        let (g_plane, b_plane) = rest.split_at_mut(plane);
+        let band_elems = BAND_ROWS * width;
+
+        r_plane[row_lo..row_hi]
+            .par_chunks_mut(band_elems)
+            .zip(g_plane[row_lo..row_hi].par_chunks_mut(band_elems))
+            .zip(b_plane[row_lo..row_hi].par_chunks_mut(band_elems))
+            .enumerate()
+            .for_each(|(band_idx, ((r_band, g_band), b_band))| {
+                let y_start = 2 + band_idx * BAND_ROWS;
+                // The last band may be shorter than `BAND_ROWS`; every chunk's
+                // length is still an exact multiple of `width`.
+                let rows_in_band = r_band.len() / width;
+                for local_y in 0..rows_in_band {
+                    let y = y_start + local_y;
+                    let row = local_y * width;
+                    for x in 2..x_hi {
+                        let rgb = interior_pixel_rgb(data, width, height, &colors, &terms, x, y);
+                        r_band[row + x] = rgb[0];
+                        g_band[row + x] = rgb[1];
+                        b_band[row + x] = rgb[2];
+                    }
+                }
+            });
     }
 
     out
 }
 
 /// The full VNG-interpolated RGB triple at one interior CFA site (a site with
-/// a complete 5×5 window). Extracted so the interior pass above and the
-/// `#[cfg(test)]` serial reference below call the exact same per-pixel
-/// arithmetic — there is only one place it is written.
+/// a complete 5×5 window). Used by both the parallel interior pass above and
+/// the `#[cfg(test)]` serial reference — the shared function is what makes
+/// band-splitting provably bit-identical: there is only one place the
+/// per-pixel arithmetic is written.
 fn interior_pixel_rgb(
     data: &[f32],
     width: usize,
@@ -477,13 +522,12 @@ mod tests {
             .collect()
     }
 
-    /// `vng_debayer_f32` must produce EXACTLY the same floats as the serial
-    /// reference — not "close", `==` on every element. Guards the upcoming
-    /// row-band parallelization: covers a ≥512×512 mosaic (several full bands
-    /// once banded) and an odd-sized one (517×389 — not a multiple of the band
-    /// height, so a later band is partial and a band boundary lands mid-frame)
-    /// for two Bayer patterns. Trivially true right now (both sides are the
-    /// same serial loop); stays true once the loop above is parallelized.
+    /// `vng_debayer_f32`'s row-banded parallel interior pass must produce
+    /// EXACTLY the same floats as the serial reference — not "close", `==` on
+    /// every element. Covers a ≥512×512 mosaic (several full `BAND_ROWS` bands)
+    /// and an odd-sized one (517×389 — not a multiple of `BAND_ROWS`, so the
+    /// last band is partial and a band boundary lands mid-frame) for two
+    /// Bayer patterns.
     #[test]
     fn parallel_matches_serial_reference() {
         for &(w, h) in &[(512usize, 512usize), (517usize, 389usize)] {

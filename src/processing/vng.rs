@@ -142,7 +142,6 @@ pub fn vng_debayer_f32(
     }
 
     let colors = tile_colors(pattern);
-    let color_at = |x: usize, y: usize| colors[(y & 1) * 2 + (x & 1)];
 
     // Interior = every site with a full 5×5 window. `saturating_sub` keeps the
     // range empty (rather than panicking) on images narrower/shorter than that.
@@ -155,92 +154,116 @@ pub fn vng_debayer_f32(
 
     for y in 2..y_hi {
         for x in 2..x_hi {
+            let rgb = interior_pixel_rgb(data, width, height, &colors, &terms, x, y);
             let center = y * width + x;
-            let base = data[center];
-            let center_color = color_at(x, y);
-
-            let sample = |dx: i32, dy: i32| -> f32 {
-                data[(y as i32 + dy) as usize * width + (x as i32 + dx) as usize]
-            };
-
-            let mut gradients = [0f32; 8];
-            // Weighted MEAN, not sum, of the same-colour difference terms: a
-            // direction that had to drop cross-colour pairs must stay comparable
-            // with one that kept all six. `wsum` is never zero — the first two
-            // terms of every direction are same-colour by construction.
-            for (d, dir_terms) in terms.iter().enumerate() {
-                let mut g = 0f32;
-                let mut wsum = 0f32;
-                for (t, &((ax, ay), (bx, by))) in dir_terms.iter().enumerate() {
-                    if color_at((x as i32 + ax) as usize, (y as i32 + ay) as usize)
-                        != color_at((x as i32 + bx) as usize, (y as i32 + by) as usize)
-                    {
-                        continue;
-                    }
-                    let w = if t < FULL_WEIGHT_TERMS { 1.0 } else { 0.5 };
-                    g += w * (sample(ax, ay) - sample(bx, by)).abs();
-                    wsum += w;
-                }
-                gradients[d] = g / wsum;
-            }
-
-            let mut g_min = gradients[0];
-            let mut g_max = gradients[0];
-            for &g in &gradients[1..] {
-                if g < g_min {
-                    g_min = g;
-                }
-                if g > g_max {
-                    g_max = g;
-                }
-            }
-            // Equal min and max (a flat neighbourhood) admits all eight.
-            let threshold = 1.5 * g_min + 0.5 * (g_max - g_min);
-
-            // Each selected direction contributes one full colour triple, taken
-            // from its immediate neighbour. The neighbour only carries one real
-            // sample, so the other two colours come from the bilinear estimate
-            // there; the centre's OWN colour instead averages the centre with the
-            // sample two steps out, which is a real sample of that colour
-            // whenever the neighbour is not.
-            let mut color_sum = [0f32; 3];
-            let mut n_dirs = 0u32;
-            for (d, &(ux, uy)) in DIRECTIONS.iter().enumerate() {
-                if gradients[d] > threshold {
-                    continue;
-                }
-                n_dirs += 1;
-                let (nx, ny) = ((x as i32 + ux) as usize, (y as i32 + uy) as usize);
-                let (fx, fy) = ((x as i32 + 2 * ux) as usize, (y as i32 + 2 * uy) as usize);
-                let neighbour = bilinear_rgb_at(data, width, height, &colors, nx, ny);
-                // Two steps out keeps both coordinate parities, so it is always a
-                // real sample of the centre's own colour. When the neighbour is a
-                // different colour, pairing those two beats reading the
-                // neighbour's interpolated value for that colour.
-                let pair_with_far = color_at(nx, ny) != center_color;
-                for c in 0..3 {
-                    color_sum[c] += if c == center_color && pair_with_far {
-                        0.5 * (base + data[fy * width + fx])
-                    } else {
-                        neighbour[c]
-                    };
-                }
-            }
-
-            // At least one direction is always selected: the threshold is never
-            // below the smallest gradient, so `n_dirs` is never zero.
-            let center_mean = color_sum[center_color] / n_dirs as f32;
             for c in 0..3 {
-                out[c * plane + center] = if c == center_color {
-                    base
-                } else {
-                    base + (color_sum[c] / n_dirs as f32 - center_mean)
-                };
+                out[c * plane + center] = rgb[c];
             }
         }
     }
 
     out
+}
+
+/// The full VNG-interpolated RGB triple at one interior CFA site (a site with
+/// a complete 5×5 window). Extracted so the interior pass above and the
+/// `#[cfg(test)]` serial reference below call the exact same per-pixel
+/// arithmetic — there is only one place it is written.
+fn interior_pixel_rgb(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    colors: &[usize; 4],
+    terms: &[[(Offset, Offset); GRADIENT_TERMS]; 8],
+    x: usize,
+    y: usize,
+) -> [f32; 3] {
+    let color_at = |x: usize, y: usize| colors[(y & 1) * 2 + (x & 1)];
+
+    let center = y * width + x;
+    let base = data[center];
+    let center_color = color_at(x, y);
+
+    let sample = |dx: i32, dy: i32| -> f32 {
+        data[(y as i32 + dy) as usize * width + (x as i32 + dx) as usize]
+    };
+
+    let mut gradients = [0f32; 8];
+    // Weighted MEAN, not sum, of the same-colour difference terms: a
+    // direction that had to drop cross-colour pairs must stay comparable
+    // with one that kept all six. `wsum` is never zero — the first two
+    // terms of every direction are same-colour by construction.
+    for (d, dir_terms) in terms.iter().enumerate() {
+        let mut g = 0f32;
+        let mut wsum = 0f32;
+        for (t, &((ax, ay), (bx, by))) in dir_terms.iter().enumerate() {
+            if color_at((x as i32 + ax) as usize, (y as i32 + ay) as usize)
+                != color_at((x as i32 + bx) as usize, (y as i32 + by) as usize)
+            {
+                continue;
+            }
+            let w = if t < FULL_WEIGHT_TERMS { 1.0 } else { 0.5 };
+            g += w * (sample(ax, ay) - sample(bx, by)).abs();
+            wsum += w;
+        }
+        gradients[d] = g / wsum;
+    }
+
+    let mut g_min = gradients[0];
+    let mut g_max = gradients[0];
+    for &g in &gradients[1..] {
+        if g < g_min {
+            g_min = g;
+        }
+        if g > g_max {
+            g_max = g;
+        }
+    }
+    // Equal min and max (a flat neighbourhood) admits all eight.
+    let threshold = 1.5 * g_min + 0.5 * (g_max - g_min);
+
+    // Each selected direction contributes one full colour triple, taken
+    // from its immediate neighbour. The neighbour only carries one real
+    // sample, so the other two colours come from the bilinear estimate
+    // there; the centre's OWN colour instead averages the centre with the
+    // sample two steps out, which is a real sample of that colour
+    // whenever the neighbour is not.
+    let mut color_sum = [0f32; 3];
+    let mut n_dirs = 0u32;
+    for (d, &(ux, uy)) in DIRECTIONS.iter().enumerate() {
+        if gradients[d] > threshold {
+            continue;
+        }
+        n_dirs += 1;
+        let (nx, ny) = ((x as i32 + ux) as usize, (y as i32 + uy) as usize);
+        let (fx, fy) = ((x as i32 + 2 * ux) as usize, (y as i32 + 2 * uy) as usize);
+        let neighbour = bilinear_rgb_at(data, width, height, colors, nx, ny);
+        // Two steps out keeps both coordinate parities, so it is always a
+        // real sample of the centre's own colour. When the neighbour is a
+        // different colour, pairing those two beats reading the
+        // neighbour's interpolated value for that colour.
+        let pair_with_far = color_at(nx, ny) != center_color;
+        for c in 0..3 {
+            color_sum[c] += if c == center_color && pair_with_far {
+                0.5 * (base + data[fy * width + fx])
+            } else {
+                neighbour[c]
+            };
+        }
+    }
+
+    // At least one direction is always selected: the threshold is never
+    // below the smallest gradient, so `n_dirs` is never zero.
+    let center_mean = color_sum[center_color] / n_dirs as f32;
+    let mut result = [0f32; 3];
+    for c in 0..3 {
+        result[c] = if c == center_color {
+            base
+        } else {
+            base + (color_sum[c] / n_dirs as f32 - center_mean)
+        };
+    }
+    result
 }
 
 /// Bilinear RGB estimate at one CFA site: the site's own sample for its own
@@ -398,6 +421,88 @@ mod tests {
         let cfa = cfa_fill(w, h, BayerPattern::Rggb, -0.1, -0.1, -0.1);
         let rgb = vng_debayer_f32(&cfa, w, h, BayerPattern::Rggb);
         assert!(rgb.iter().all(|v| (*v - -0.1).abs() < 1e-6));
+    }
+
+    /// A straightforward SERIAL copy of `vng_debayer_f32`'s interior pass —
+    /// same border call, same nested `y`/`x` loop, same per-pixel helper
+    /// (`interior_pixel_rgb`) — kept only so `parallel_matches_serial_reference`
+    /// has something to diff the row-banded version against. It must never grow
+    /// a second implementation of the per-pixel math; if `interior_pixel_rgb`
+    /// changes, this changes with it for free.
+    fn vng_debayer_f32_serial_reference(
+        data: &[f32],
+        width: usize,
+        height: usize,
+        pattern: BayerPattern,
+    ) -> Vec<f32> {
+        debug_assert!(pattern != BayerPattern::None);
+        debug_assert_eq!(data.len(), width * height);
+
+        let plane = width * height;
+        let mut out = vec![0f32; 3 * plane];
+
+        let colors = tile_colors(pattern);
+        let x_hi = width.saturating_sub(2);
+        let y_hi = height.saturating_sub(2);
+
+        bilinear_border(data, width, height, &colors, x_hi, y_hi, &mut out);
+
+        let terms = gradient_terms();
+
+        for y in 2..y_hi {
+            for x in 2..x_hi {
+                let rgb = interior_pixel_rgb(data, width, height, &colors, &terms, x, y);
+                let center = y * width + x;
+                for c in 0..3 {
+                    out[c * plane + center] = rgb[c];
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Deterministic pseudo-random CFA fill (xorshift64*) so the bit-identity
+    /// test below is reproducible without pulling in a `rand` dependency.
+    fn pseudo_random_mosaic(w: usize, h: usize, seed: u64) -> Vec<f32> {
+        let mut state = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        (0..w * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let frac = ((state >> 40) & 0xFFFF) as f32 / 0xFFFF as f32; // [0, 1]
+                frac * 65535.0 // FITS-u16-ish dynamic range
+            })
+            .collect()
+    }
+
+    /// `vng_debayer_f32` must produce EXACTLY the same floats as the serial
+    /// reference — not "close", `==` on every element. Guards the upcoming
+    /// row-band parallelization: covers a ≥512×512 mosaic (several full bands
+    /// once banded) and an odd-sized one (517×389 — not a multiple of the band
+    /// height, so a later band is partial and a band boundary lands mid-frame)
+    /// for two Bayer patterns. Trivially true right now (both sides are the
+    /// same serial loop); stays true once the loop above is parallelized.
+    #[test]
+    fn parallel_matches_serial_reference() {
+        for &(w, h) in &[(512usize, 512usize), (517usize, 389usize)] {
+            for pattern in [BayerPattern::Rggb, BayerPattern::Gbrg] {
+                let seed = 0xC0FF_EE00_u64 ^ (w as u64) ^ ((h as u64) << 32);
+                let cfa = pseudo_random_mosaic(w, h, seed);
+
+                let parallel = vng_debayer_f32(&cfa, w, h, pattern);
+                let serial = vng_debayer_f32_serial_reference(&cfa, w, h, pattern);
+
+                assert_eq!(parallel.len(), serial.len());
+                for (i, (&p, &s)) in parallel.iter().zip(serial.iter()).enumerate() {
+                    assert_eq!(
+                        p, s,
+                        "{pattern:?} {w}x{h}: mismatch at flat index {i} (parallel {p} != serial {s})"
+                    );
+                }
+            }
+        }
     }
 
     /// Compares our VNG against the external reference's debayered output for the

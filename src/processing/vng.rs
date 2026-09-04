@@ -61,10 +61,11 @@ const GRADIENT_TERMS: usize = 6;
 
 /// Row-band height for the parallel interior pass. Each band is one rayon
 /// task, so it must comfortably clear task-dispatch overhead (kept well above
-/// the 32-row floor); at the same time a 26 MP frame (4176 rows) still splits
-/// into ~65 bands, several times the machine's 10 cores, so rayon's work
-/// stealing can even out the 4-performance/6-efficiency core split without
-/// hand-tuning per-core weights.
+/// the 32-row floor); at the same time a full-height frame should still split
+/// into many more bands than there are cores, so rayon's work-stealing can
+/// balance heterogeneous cores on its own — without hand-tuned per-core
+/// weights — and the tail (last, possibly partial) band stays a small
+/// fraction of the total work.
 const BAND_ROWS: usize = 64;
 
 /// The first two gradient terms carry full weight, the remaining four a half
@@ -176,7 +177,7 @@ pub fn vng_debayer_f32(
     // `interior_pixel_rgb`, so which thread computes which band cannot change
     // a single output value.
     let interior_rows = y_hi.saturating_sub(2);
-    if interior_rows > 0 {
+    if interior_rows > 0 && width > 0 {
         let row_lo = 2 * width;
         let row_hi = y_hi * width;
         let (r_plane, rest) = out.split_at_mut(plane);

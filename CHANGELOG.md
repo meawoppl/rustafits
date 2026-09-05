@@ -5,15 +5,58 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] — 2026-09-05
 
 ### Added
+
+- **`processing::vng::vng_debayer_f32` — full-resolution 8-gradient VNG
+  demosaic.** Unlike `super_pixel_debayer_f32`, which averages each 2×2 CFA
+  block and so halves both axes and broadens every star profile, VNG keeps the
+  native pixel grid and returns planar RGB at the input geometry. This is what a
+  one-shot-colour frame needs when the output is going into stacking rather than
+  onto a screen. Validated against an external reference demosaic on real
+  26 MP frames: median |difference| on interior pixels is 0 in green and ~3e-5
+  in red and blue on a 0..65535 scale. Bit-identity with another implementation
+  is not a goal — gradient thresholds are an implementation choice.
+
+  The interior pass runs on rayon in 64-row bands. The split is by output row
+  only and every band reads the same immutable mosaic, so the result does not
+  depend on the thread count or on where a band boundary falls; a serial
+  reference in the test module pins that. Measured on a 6248×4176 frame:
+  3.9 s serial → 0.74 s.
 
 - `encode_jpeg` — in-memory RGB/RGBA → baseline JPEG (4:2:0) encoding on the
   library surface, for embedders that need JPEG bytes without a file write
   (Athenaeum's Perseus preview). Backed by the same encoder `save_image` uses;
   RGBA alpha is read and discarded, so callers pass frames through without a
   de-interleaving copy.
+
+- **Adaptive multi-level fast detection** replaces the single global threshold:
+  a falling-threshold ladder with an occupancy mask, a saturation-aware level
+  clip and a per-tile deep background, so long-focal-length and
+  nebula-swamped fields still yield enough well-centroided stars to solve.
+  `detect_fast`/`_data`/`_raw` use it; the analysis-UI detector is untouched.
+- `build_quads_multi` — quad-pool densification for sparse fields via a
+  configurable per-star group size. `build_quads` is preserved exactly as the
+  `group_size = 4` case.
+- Per-star SNR on `FastStar`. `detect_stars_adaptive` already computed an
+  aperture-photometry SNR and discarded it; exposing it lets a solver re-rank
+  its quad pool, because extended nebula and galaxy knots carry huge flux at
+  low SNR and would otherwise crowd the top of a flux-ranked pool. No behaviour
+  change on its own — the consumer opts in.
+- Opt-in PSF centroid refinement: `ImageAnalyzer::with_centroid_refine`, plus
+  `FastStar { sx, sy, fwhm }`. Default OFF, so `detect_fast` output is
+  unchanged unless asked. `raw_x`/`raw_y` keep the pass-1 intensity-weighted
+  centroid alongside the refined one, so a caller can compare the two per frame.
+- `AnnotationConfig::ellipse_scale` (default 1.2× FWHM, was a hardcoded 2.5×).
+  The old scale drew ~50 px lassos on oversampled frames, where clean single
+  stars visually covered their neighbours and read as blends.
+- `tracing` as a facade (no subscriber in library code): the analysis
+  pipeline's already-measured stage durations are now also emitted as
+  structured `debug!` events instead of being available only as returned
+  `StageTiming`/`FastDetectTiming` data.
+- `DataType` is re-exported, so consumers and tests can build an
+  `ImageMetadata` without reaching into a private module.
 
 ### Changed
 
@@ -49,6 +92,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Image save failed` now succeeds at the clamped quality.
   `ImageConverter::with_quality` and the CLI already clamped/validated, so they
   are unaffected.
+
+- Pass-2 measurement now rejects blended close pairs. Tight pairs used to
+  collapse into one elongated pseudo-star, and slightly wider ones fragmented
+  into two survivors each measuring the other's light: on a dense oversampled
+  bench frame ~31 % of measured stars had a second significant peak inside
+  their fitting window.
+
+### Fixed
+
+- **A frame containing NaN no longer renders black.** `compute_stretch_params`
+  skips non-finite samples; quickselect is comparison-based, so a single NaN
+  in the sample set poisoned the median and MADN and every stretch parameter
+  came back NaN — with no error anywhere. Float FITS/XISF routinely carries NaN
+  in registration borders and rejected pixels. A fully non-finite frame now
+  falls back to neutral parameters; scattered NaN pixels still render black
+  individually, which is the right display for missing data.
+- **The fast detector's star cap is applied after a full scan, not in scan
+  order.** `scan_region` returned as soon as `max_stars` detections had
+  accumulated — row-major, so on a dense frame the fast path only ever saw a
+  horizontal stripe (on `cocoon.fits`, all 500 stars sat above y = 1470 of
+  4176, a 3 % overlap with the slow pipeline's top 100). Plate solving received
+  spatially degenerate star sets, and registration fitted a transform on one
+  stripe and extrapolated it across the frame.
+- Per-star fit sigma is floored at the field sigma from bright-star
+  calibration. On defocused frames the per-star half-max estimate collapsed and
+  shrank the fit window to ~5 px, reporting 0.5–3 px FWHM for true 9–16 px
+  stars. Defocused reference sets now land within ~5 % of an external
+  measurement tool.
+- `moments_ellipse` confines its initialising moments to the circular fitting
+  disc instead of summing over the whole square stamp, where corners and
+  neighbouring stars skewed the initial axis ratio and angle enough to strand
+  the LM fit in a rounder local minimum. Matched-set eccentricity delta against
+  an external per-star reference improves from a median of −0.019 to −0.007,
+  and theta RMS from 19.7° to 13.8°.
+- The FITS reader rejects `NAXIS3` outside {1, 3} with an error naming the
+  offending value, instead of letting it flow through and corrupt downstream
+  channel-count assumptions. `NAXIS < 3` keeps the mono default.
+- XISF headers containing a dangling `&` in element text load again.
+  quick-xml 0.41 rejects a lone ampersand where 0.36/0.37 read straight
+  through; the reader opts back into permissive parsing. XISF headers are
+  machine-written so this is rare, but a malformed one should still render
+  rather than fail to load.
+- XISF `Uint8` samples scale by 257, not 256, so 255 maps to 65535 — 8-bit data
+  rendered about 0.4 % darker than the same image stored as `u16`.
+- `ImageConverter::with_downscale` clamps its factor to ≥ 1; zero divided by
+  zero inside the downscale kernels.
+
+### Dependencies
+
+- quick-xml 0.41, nalgebra 0.35, lz4_flex 0.14, ruzstd 0.9, base64 0.23.
+- The unused `criterion` dev-dependency is gone.
 
 ## [1.0.1] — 2026-05-07
 
@@ -127,4 +221,5 @@ land in 1.x; breaking changes will require 2.0.
 - Fast detection produces pass-1 centroids (~0.3–0.5 px accuracy). Use
   `analyze` when you need FWHM, eccentricity, HFR, SNR, or any PSF metric.
 
+[1.1.0]: https://github.com/eg013ra1n/rustafits/releases/tag/v1.1.0
 [1.0.0]: https://github.com/eg013ra1n/rustafits/releases/tag/v1.0.0

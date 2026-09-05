@@ -5,6 +5,42 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-09-06
+
+### Added
+
+- **`FastStar::eccentricity` — the fast detector measures star shape.** It was
+  computed only by the full analysis path, so anything reading `detect_fast`
+  could not tell a star from a streak; a plate solver would happily build
+  quads out of streak fragments and return a confident, wrong position. The
+  moment maths is now shared (`shape_from_moments`) and runs for every fast
+  detection: 0 is round, approaching 1 is a streak.
+
+  The stamp follows the star's own size (2 × HFD, clamped) rather than a fixed
+  width. This is the whole point of the change: a window narrower than the
+  object sees only its bright core and reports it round, which is exactly what
+  happens on wind-shaken frames whose stars are 13 px across.
+
+  Read this rather than `sx`/`sy` when the question is "star or trail".
+  Those come from the optional Moffat fit, which declines almost everything on
+  a trailed frame — leaving them zero precisely when the shape matters most.
+  Measured on real frames: healthy fields sit at median eccentricity 0.50,
+  frames whose stars are streaks at 0.97.
+
+  Minor, not patch, on the same reasoning as v1.1.0's `FastStar` additions:
+  the struct gains a public field.
+
+### Documentation
+
+- `docs/platesolving.md` is new — what the crate does and does not provide for
+  a solver (detection, quads, the shape gate above), written against the
+  shipped API rather than an intended one. `docs/detection.md` and
+  `docs/fitting.md` gained the sections that had drifted out of them.
+- README, `CLAUDE.md` and `docs/usage.md` describe the API as it ships: the
+  VNG entry point, `encode_jpeg`, and the fact that a one-shot-colour frame
+  rendered through `ImageConverter` still goes through the half-resolution
+  super-pixel path.
+
 ## [1.1.0] — 2026-09-05
 
 ### Added

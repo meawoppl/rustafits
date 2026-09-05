@@ -12,6 +12,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 - **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
+- **Plate-Solving Blocks**: quad pattern matching, RANSAC outlier rejection, gnomonic projection, affine/SIP transform fitting and a WCS you can write to a FITS header — building blocks, no catalogue and no orchestration (see [docs/platesolving.md](docs/platesolving.md))
 - **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the precise analyzer
 - **Pure-Rust JPEG Encoder**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2/SSE2 on x86_64, scalar fallback elsewhere) — baseline 4:2:0, no C toolchain, no cmake/nasm
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
@@ -554,8 +555,8 @@ rustafits/
 │   │   ├── downscale.rs     # Integer downscaling
 │   │   └── color.rs         # Color conversions (SIMD)
 │   └── platesolving/        # Quad pattern matching, RANSAC, WCS, gnomonic
-│       │                    # projection, proper motion. Public but not yet
-│       │                    # covered by this README.
+│       │                    # projection, proper motion, transform fitting.
+│       │                    # See docs/platesolving.md
 │       └── ...
 ```
 

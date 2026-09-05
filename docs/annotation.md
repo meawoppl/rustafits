@@ -145,6 +145,7 @@ let config = AnnotationConfig {
 |-------|------|---------|-------------|
 | `color_scheme` | `ColorScheme` | `Eccentricity` | How stars are colored (see below). |
 | `show_direction_tick` | `bool` | `true` | Draw ticks along the elongation axis. Only shown when eccentricity > 0.15. Length proportional to eccentricity. |
+| `ellipse_scale` | `f32` | `1.2` | Semi-axis as a multiple of the measured FWHM, before clamping. Was a hardcoded `2.5`: on oversampled frames that drew semi-axes wide enough for a clean single star to cover its neighbours and read as a blend. |
 | `min_radius` | `f32` | `6.0` | Minimum ellipse semi-axis in output pixels. Prevents tiny annotations on undersampled stars. |
 | `max_radius` | `f32` | `60.0` | Maximum ellipse semi-axis in output pixels. Prevents oversized annotations on saturated stars. |
 | `line_width` | `u8` | `2` | Line thickness. `1` = single pixel, `2` = 3px cross kernel, `3` = 5px diamond. |
@@ -169,8 +170,8 @@ Returned by `compute_annotations()`. All coordinates are in output image space.
 |-------|------|-------------|
 | `x` | `f32` | Centroid X in output image coordinates. |
 | `y` | `f32` | Centroid Y in output image coordinates. |
-| `semi_major` | `f32` | Ellipse semi-major axis (output pixels). Derived from `fwhm_x * scale * 2.5`, clamped to `[min_radius, max_radius]`. |
-| `semi_minor` | `f32` | Ellipse semi-minor axis (output pixels). Derived from `fwhm_y * scale * 2.5`, clamped to `[min_radius, max_radius]`. |
+| `semi_major` | `f32` | Ellipse semi-major axis (output pixels). `fwhm_x * scale_x * ellipse_scale`, clamped to `[min_radius, max_radius]`. |
+| `semi_minor` | `f32` | Ellipse semi-minor axis (output pixels). `fwhm_y * scale_y * ellipse_scale`, clamped to `[min_radius, max_radius]`. |
 | `theta` | `f32` | Rotation angle in radians, counter-clockwise from +X axis. |
 | `eccentricity` | `f32` | Original eccentricity value from analysis. |
 | `fwhm` | `f32` | Original geometric mean FWHM in analysis pixels. |
@@ -217,7 +218,7 @@ and `create_annotation_layer()`, pass `image.flip_vertical` explicitly.
 For each detected star:
 
 - **Rotated ellipse** centered on the star's centroid, using `fwhm_x`, `fwhm_y`,
-  and `theta` from the analysis. Semi-axes are scaled by 2.5x for visibility and
+  and `theta` from the analysis. Semi-axes are scaled by `ellipse_scale` (1.2x by default) and
   clamped to `[min_radius, max_radius]`.
 
 - **Color** based on the chosen scheme and configurable thresholds. Default

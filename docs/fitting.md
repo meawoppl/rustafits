@@ -391,6 +391,51 @@ proceeds without a fixed beta constraint.
 When `field_beta` is `None` (calibration did not produce one), pass 2 falls
 back to free-beta Moffat as the primary fitter.
 
+### Fit window sizing, and why `field_fwhm` floors it
+
+Every pass-2 path (HFR, moments, Gaussian, Moffat) sizes its window from a
+robust per-star sigma, `estimate_sigma_halfmax` — a half-maximum walk out from
+the peak. That estimate is then floored at the field value from pass 1:
+
+```
+robust_sigma = max(estimate_sigma_halfmax(stamp), field_fwhm / 2.3548)
+```
+
+The floor exists because the per-star walk **collapses on broad, low-amplitude
+profiles** — a defocused frame is the everyday case. There, the local-background
+annulus at r in [4, 8] px sits *inside* the profile rather than outside it, and
+the peak reads a single noisy pixel; sigma comes back far too small and shrinks
+the LM window to ~5 px. The fit then converges happily on a sub-pixel FWHM with a
+low residual, and because the residual is low it carries weight in the weighted
+median — so a defocused set reported 0.5-3 px for stars whose true FWHM was
+9-16 px.
+
+The field value from bright-star calibration is the reliable lower bound; the
+per-star estimate still wins whenever it reads larger, so in-focus frames are
+unaffected. With the floor in place, defocused reference sets land within ~5 % of
+an external measurement tool.
+
+`field_fwhm` is `None` only when calibration produced nothing, in which case the
+raw per-star estimate is used as before.
+
+### Ellipse initialisation: moments confined to the fitting disc
+
+`moments_ellipse` supplies the LM fit's initial axis ratio and angle. It sums
+intensity over the stamp, but **only within the circular fitting radius** —
+pixels outside it are skipped:
+
+```
+if dx*dx + dy*dy > radius_sq { continue }
+```
+
+Summing the whole square stamp instead pulled in the corners and any neighbouring
+star that happened to sit in them, skewing the initial axis ratio enough to
+strand the fit in a rounder local minimum — and a fit that starts round tends to
+stay round. Verified per-star against an external reference: on an m42 30 s frame
+the matched-set eccentricity delta improves from a median of -0.019 (with a tail
+of bright stars reading 0.18 for a true 0.55) to -0.007, and theta RMS from
+19.7 deg to 13.8 deg.
+
 ### FitMethod Enum
 
 Each `StarMetrics` carries a `FitMethod` value indicating which model produced

@@ -91,6 +91,31 @@ list.
 
 ---
 
+## Pass-2 Close-Pair Rejection
+
+NMS removes sidelobes, so any close pair that *survives* it is two genuine stars
+whose PSFs overlap — and an overlapping companion inside the measurement window
+corrupts the fit. Two distinct shapes are rejected on pass 2, because they fail
+differently:
+
+1. **Collapsed pair.** A kept peak that suppressed a comparable-strength
+   neighbour (`BLEND_CONV_RATIO = 0.25` of its convolution response) now has
+   that neighbour's light inside its own measurement window. The fit reads one
+   elongated pseudo-star. Tracked at suppression time and rejected.
+2. **Fragmented pair.** A slightly wider pair keeps *both* peaks through NMS,
+   but their final centroids land inside each other's fitting discs — convolution
+   peaks repel past the suppression radius while flux-weighted centroids attract
+   (measured: peaks 11 px apart, centroids 6 px). A second sweep over the
+   measured centroids rejects any two closer than the fitting disc.
+
+Both use the disc the LM fit actually integrates over, `max(5, 4 sigma)` from
+`metrics.rs`, rather than a separate tunable — a companion outside that disc
+barely moves the fit. The centroid sweep runs only when calibration produced a
+`field_fwhm`.
+
+Scale of the problem on a dense oversampled bench frame: ~31 % of measured stars
+had a second significant peak inside their fitting window before this.
+
 ## Stage 2: Proximity-Based Blend Detection
 
 ```
@@ -291,3 +316,57 @@ measurement:
 | Max stars         | 200          | Performance cap (configurable)            |
 | Min stamp radius  | 5            | 11x11 stamp for smallest blobs           |
 | Stamp scale       | 2 * sqrt(area/pi) | Scales with equivalent circular radius |
+
+## Adaptive Multi-Level Detection (the plate-solving detector)
+
+Everything above describes the **precise analyzer's** detection. The fast path
+(`detect_fast` / `_data` / `_raw`) uses a different detector,
+`detect_stars_adaptive` in `analysis/adaptive_detection.rs`, because a single
+global threshold behaves badly on exactly the frames a solver most needs: it
+either drowns in the diffuse light of a bright nebula or galaxy, or thresholds
+that diffuse light itself as one giant blob. Long-focal-length and
+extended-object fields under-detect either way.
+
+It deepens adaptively instead:
+
+1. **Falling-threshold ladder with an occupancy mask.** Bright stars are found
+   first at a high, star-count-derived level and their `3 * HFD` disks marked
+   claimed; progressively lower thresholds then add only fainter, not-yet-claimed
+   stars. The deepest pass recomputes background and noise on a 12xN mesh, so a
+   faint star sitting *on top of* nebulosity clears a local threshold rather than
+   a global one.
+2. **Saturation-aware level clip**, `level = max(3.5 sigma, level - bg - 1)`, so
+   a flat-topped saturated core still presents supra-threshold pixels and gets
+   detected and centroided instead of vanishing.
+3. **MAD-annulus local background and a shrink-to-symmetry flux-weighted
+   centroid**, with a >=2/4 cross-neighbour hot-pixel gate and `snr > 10`,
+   `hfd in (hfd_min, 30]` accept tests — clean centroids on a contaminated or
+   gradient background.
+
+Background for the ladder comes from the **histogram mode**, not a mean: a mean
+chases the bright extended light of a nebula, the mode does not. Noise is a
+3-sigma-clipped RMS about that background.
+
+### The star cap is applied after a full scan
+
+`max_stars` caps the *result*, not the scan. Each ladder level completes its
+whole-frame scan before the between-level count check, bounded only by a safety
+budget of `max(64 * max_stars, 8192)` detections.
+
+This matters more than it sounds. `scan_region` used to return the moment
+`max_stars` detections had accumulated — and the scan is row-major, so on a dense
+frame the fast path only ever saw a horizontal stripe of the image: on
+`cocoon.fits`, all 500 stars sat above y = 1470 of 4176, a 3 % overlap with the
+slow pipeline's top 100. A solver then received a spatially degenerate star set,
+and registration fitted a transform on one stripe and extrapolated it across the
+whole frame.
+
+### What the fast path reports
+
+`FastStar` carries `x`/`y` (pass-1 intensity-weighted, or PSF-refined under
+`with_centroid_refine`), `raw_x`/`raw_y` (always the unrefined pass-1 value),
+`peak`, `flux`, and `snr` — the aperture-photometry SNR
+`flux / sqrt(flux + pi r^2 sigma^2)`. SNR is what separates a compact source from
+extended structure carrying high flux over a large aperture, so a solver can
+re-rank its quad pool by it instead of by flux alone, where galaxy and nebula
+knots crowd the top.

@@ -52,7 +52,8 @@ let result = analyzer.analyze("light_001.fits")?;
 | `with_fit_max_iter(usize)` | 25 | LM max iterations for pass-2 measurement fits. Calibration pass always uses 50. |
 | `with_fit_tolerance(f64)` | 1e-4 | LM convergence tolerance for pass-2 measurement fits. Calibration pass always uses 1e-6. |
 | `with_fit_max_rejects(usize)` | 5 | Consecutive LM step rejects before early bailout. Stars that bail out fall through to the next method in the Moffat→Gaussian→Moments chain. |
-| `with_optics(f32, f32)` | None | `with_optics(focal_mm, pixel_um)` enables arcsecond output for FWHM and HFR. |
+| `with_optics(f64, f64)` | None | `with_optics(focal_mm, pixel_um)` enables arcsecond output for FWHM and HFR. |
+| `with_centroid_refine(bool)` | `false` | Refine each fast-detection centroid with the Moffat LM and fill `sx`/`sy`/`fwhm` on `FastStar`. Off by default so `detect_fast` output stays byte-identical; per-star gates (SNR < 10, non-physical fit, centre moved > 2 px) keep the pass-1 centroid. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
 ### When to Adjust

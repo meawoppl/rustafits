@@ -6,7 +6,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 
 - **FITS & XISF Support**: Native readers for both formats (no external libraries)
 - **Auto-Stretch**: Median-based statistical stretching (STF-compatible midtones transfer)
-- **Bayer Debayering**: Super-pixel 2x2 block averaging (RGGB, BGGR, GBRG, GRBG)
+- **Bayer Debayering**: two paths for two jobs — super-pixel 2x2 block averaging for fast display (halves both axes), and **full-resolution VNG** (8-gradient, variable number of gradients) when the output feeds stacking or pixel-level inspection rather than a screen. All four patterns (RGGB, BGGR, GBRG, GRBG)
 - **Preview Mode**: 2x2 binning for fast previews
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
@@ -119,6 +119,34 @@ let image: ProcessedImage = ImageConverter::new()
 // image.channels - 3 (RGB) or 4 (RGBA)
 // image.is_color - true if debayered/RGB, false if mono (gray replicated to RGB)
 ```
+
+### Full-resolution debayer (VNG)
+
+`ImageConverter` debayers with the super-pixel path, which averages each 2x2 CFA
+block and so returns half the width and half the height. When you need the native
+pixel grid — stacking input, or inspecting stars at 1:1 — call the VNG demosaic
+directly:
+
+```rust
+use astroimage::processing::vng::vng_debayer_f32;
+use astroimage::BayerPattern;
+
+// `mosaic` is one f32 sample per pixel, width * height long.
+let rgb: Vec<f32> = vng_debayer_f32(&mosaic, width, height, BayerPattern::Rggb);
+
+// Planar RGB at the INPUT geometry: [R plane][G plane][B plane],
+// each width * height long — 3 * width * height in total.
+```
+
+It is the more expensive of the two by a wide margin: on a 26 MP (6248x4176)
+frame, super-pixel takes ~3.6 ms and returns 6 MP, while VNG takes ~0.7 s and
+returns 26 MP — roughly 48x the cost per output pixel, for 4x the pixels, plus
+~313 MB for the planar f32 result. Use it deliberately, not as the default for
+previews or thumbnails.
+
+The interior pass is parallelised over 64-row bands via rayon. The split is by
+output row and every band reads the same immutable mosaic, so the result does not
+depend on the thread count or on where a band boundary falls.
 
 ### Image analysis
 
@@ -290,6 +318,7 @@ Three API tiers for different integration needs:
 |-------|---------|-------------|
 | `color_scheme` | `Eccentricity` | `Eccentricity` (tracking/optics), `Fwhm` (focus), or `Uniform` (all green) |
 | `show_direction_tick` | `true` | Draw ticks along elongation axis (visible when ecc > 0.15) |
+| `ellipse_scale` | `1.2` | Semi-axis as a multiple of FWHM. Was a hardcoded 2.5, which drew lassos wide enough to cover neighbouring stars on oversampled frames |
 | `min_radius` | `6.0` | Minimum ellipse semi-axis in output pixels |
 | `max_radius` | `60.0` | Maximum ellipse semi-axis in output pixels |
 | `line_width` | `2` | Line thickness: `1` = 1px, `2` = 3px cross, `3` = 5px diamond |
@@ -325,6 +354,10 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `with_trail_threshold(f32)` | R² threshold for Rayleigh trail detection (default 0.5) |
 | `with_optics(f64, f64)` | Focal length (mm) + pixel size (µm) → enables arcsec output |
 | `without_debayer()` | Skip green-channel interpolation for OSC images |
+| `with_centroid_refine(bool)` | Run the Moffat LM per detection to refine the pass-1 centroid and fill `sx`/`sy`/`fwhm` (default off, so `detect_fast` output is unchanged unless asked) |
+| `with_fit_max_iter(usize)` | LM iteration ceiling per star |
+| `with_fit_tolerance(f64)` | LM convergence tolerance |
+| `with_fit_max_rejects(usize)` | Max outlier-rejection rounds in the fit |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool |
 
 ### AnalysisResult fields
@@ -401,9 +434,13 @@ solving and similar pipelines need.
 
 | Field | Type | Unit | Description |
 |-------|------|------|-------------|
-| `x`, `y` | f32 | pixels | Intensity-weighted centroid (subpixel, pass-1 accuracy) |
+| `x`, `y` | f32 | pixels | Subpixel centroid — pass-1 intensity-weighted, or PSF-refined when `with_centroid_refine(true)` |
+| `raw_x`, `raw_y` | f32 | pixels | Always the unrefined pass-1 centroid; equals `x`/`y` when refinement is off or the per-star fit was rejected |
 | `peak` | f32 | ADU | Background-subtracted peak value |
 | `flux` | f32 | ADU | Background-subtracted total flux |
+| `snr` | f32 | — | Aperture-photometry SNR, `flux / sqrt(flux + pi r^2 sigma^2)`. Separates compact sources from extended structure that carries high flux at low SNR |
+| `sx`, `sy` | f32 | pixels | Per-axis Gaussian sigma from the Moffat fit (`FWHM / 2.3548`). `0.0` when refinement is off |
+| `fwhm` | f32 | pixels | Mean fitted FWHM, `0.5 * (FWHM_x + FWHM_y)`. `0.0` when refinement is off |
 
 ### FastDetectTiming fields
 
@@ -508,13 +545,18 @@ rustafits/
 │   │   ├── fitting.rs        # LM Gaussian & Moffat PSF fitting (free/fixed beta)
 │   │   ├── metrics.rs        # FWHM, eccentricity, HFR measurement
 │   │   └── snr.rs            # Per-star and image-wide SNR
-│   └── processing/
-│       ├── mod.rs           # Processing module
-│       ├── stretch.rs       # Auto-stretch (SIMD)
-│       ├── debayer.rs       # Bayer debayering (SIMD)
-│       ├── binning.rs       # 2x2 binning (SIMD)
-│       ├── downscale.rs     # Integer downscaling
-│       └── color.rs         # Color conversions (SIMD)
+│   ├── processing/
+│   │   ├── mod.rs           # Processing module
+│   │   ├── stretch.rs       # Auto-stretch (SIMD)
+│   │   ├── debayer.rs       # Super-pixel debayer + green interpolation (SIMD)
+│   │   ├── vng.rs           # Full-resolution 8-gradient VNG demosaic (rayon)
+│   │   ├── binning.rs       # 2x2 binning (SIMD)
+│   │   ├── downscale.rs     # Integer downscaling
+│   │   └── color.rs         # Color conversions (SIMD)
+│   └── platesolving/        # Quad pattern matching, RANSAC, WCS, gnomonic
+│       │                    # projection, proper motion. Public but not yet
+│       │                    # covered by this README.
+│       └── ...
 ```
 
 **Dependencies**: anyhow, flate2 (rust_backend), lz4_flex, ruzstd, image (PNG only), libjpeg-turbo-rs (pure-Rust JPEG encoder), quick-xml, base64, rayon, nalgebra, tracing

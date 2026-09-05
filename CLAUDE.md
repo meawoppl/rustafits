@@ -43,6 +43,11 @@ The package produces two binaries (`rustafits`, `rustafits-debug`) and a library
 Pipeline flow for u16 data:
 1. Format reader (FITS big-endian / XISF little-endian) → `(ImageMetadata, PixelData)`
 2. Debayer (if Bayer pattern detected) — 2x2 super-pixel, produces planar f32 RGB
+   at HALF the input width and height. This is the only debayer in the render
+   pipeline: `vng_debayer_f32` is a library entry point callers invoke directly
+   (Athenaeum's calibrated-lights export does), not a stage `ImageConverter` can
+   be switched to. Consequence worth knowing: an OSC frame can never be rendered
+   at its native resolution through `ImageConverter`.
 3. Downscale (integer factor, operates on raw u16 before float conversion when possible)
 4. u16→f32 conversion (SIMD-accelerated)
 5. Preview binning (optional 2x2)
@@ -65,7 +70,8 @@ Pipeline flow for u16 data:
   cmake/nasm); PNG through `image`. RGBA is passed to the JPEG encoder
   unchanged — it drops alpha itself, so do NOT de-interleave to RGB first.
 - `formats/` — `fits.rs` (FITS reader), `xisf.rs` (XISF reader with zlib/LZ4/Zstd decompression)
-- `processing/` — `stretch.rs`, `debayer.rs`, `binning.rs`, `downscale.rs`, `color.rs`
+- `processing/` — `stretch.rs`, `debayer.rs` (super-pixel 2x2 + native-resolution green interpolation), `vng.rs` (full-resolution 8-gradient VNG demosaic, rayon over 64-row bands), `binning.rs`, `downscale.rs`, `color.rs`
+- `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `types.rs`. Public API, no README/docs coverage yet.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
 - `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in)
 
@@ -92,6 +98,11 @@ Test files in `tests/`:
 - `test.xisf` — XISF format
 
 Always test changes against all four files when modifying processing code.
+
+`processing::vng` carries its own guards: a serial reference implementation the
+row-banded parallel version is diffed against, and a pin against an external
+reference demosaic. Both live in the module's test section — a change to the
+band split must keep the serial diff bit-identical.
 
 `tests/jpeg_encoder.rs` needs no fixtures: it guards the JPEG encoder with
 synthetic images and decodes them with `jpeg-decoder` — deliberately an

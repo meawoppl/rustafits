@@ -225,6 +225,16 @@ pub struct FastStar {
     /// compact point sources from extended structure that has high flux but
     /// is spread over a large aperture (galaxy/nebula knots).
     pub snr: f32,
+    /// Shape of the detection from stamp-based second moments: 0 is round,
+    /// approaching 1 is a streak.
+    ///
+    /// Measured by the detector for EVERY detection, independently of the
+    /// optional PSF refinement — unlike `sx`/`sy`, which are zero whenever the
+    /// Moffat fit was not run or declined. A consumer that needs to tell a
+    /// star from a trail has to read this: on a wind-shaken frame the fit
+    /// declines almost everything, leaving `sx`/`sy` empty exactly when the
+    /// shape matters most.
+    pub eccentricity: f32,
     /// Per-axis centroid uncertainty proxy (Gaussian sigma in X, pixels).
     /// `σ_x = FWHM_x / 2.3548` from the Moffat fit. `0.0` when refinement is off.
     pub sx: f32,
@@ -1279,6 +1289,7 @@ impl ImageAnalyzer {
                 peak: ds.peak,
                 flux: ds.flux,
                 snr,
+                eccentricity: ds.eccentricity,
                 sx: 0.0,
                 sy: 0.0,
                 fwhm: 0.0,

@@ -478,6 +478,45 @@ fn process_peak_stamp(
     let cy = (sum_wy / sum_w) as f32;
 
     // Stamp-based I-weighted second moments for theta and eccentricity
+    let (theta, ecc) = shape_from_moments(
+        data,
+        width,
+        cx_i,
+        cy_i,
+        stamp_r,
+        threshold,
+        &bg_at,
+    );
+
+    Some(DetectedStar {
+        x: cx,
+        y: cy,
+        peak,
+        flux: flux as f32,
+        area,
+        theta,
+        eccentricity: ecc,
+    })
+}
+
+
+/// Position angle and eccentricity of one detection, from intensity-weighted
+/// second moments over a stamp around `(cx_i, cy_i)`.
+///
+/// `0` is round and values approaching `1` are a streak. Cheap enough to run
+/// for every detection — one pass over a small stamp — and, unlike a PSF fit,
+/// it always produces an answer: a consumer that has to tell a star from a
+/// trail cannot depend on a fit that declines exactly on the frames where the
+/// distinction matters.
+pub(crate) fn shape_from_moments(
+    data: &[f32],
+    width: usize,
+    cx_i: i32,
+    cy_i: i32,
+    stamp_r: i32,
+    threshold: f32,
+    bg_at: &dyn Fn(usize, usize) -> f32,
+) -> (f32, f32) {
     let mut sf = 0.0_f64;
     let mut six = 0.0_f64;
     let mut siy = 0.0_f64;
@@ -490,7 +529,9 @@ fn process_peak_stamp(
             let px = (cx_i + dx) as usize;
             let bg = bg_at(px, py);
             let v = data[py * width + px] - bg;
-            if v <= threshold { continue; }
+            if v <= threshold {
+                continue;
+            }
             let v = v as f64;
             sf += v;
             six += v * px as f64;
@@ -500,33 +541,26 @@ fn process_peak_stamp(
             sixy += v * (px as f64) * (py as f64);
         }
     }
-    let (theta, ecc) = if sf > 1e-10 {
-        let icx = six / sf;
-        let icy = siy / sf;
-        let mxx = sixx / sf - icx * icx;
-        let myy = siyy / sf - icy * icy;
-        let mxy = sixy / sf - icx * icy;
-        let t = (0.5 * (2.0 * mxy).atan2(mxx - myy)) as f32;
-        let trace = mxx + myy;
-        let det = mxx * myy - mxy * mxy;
-        let disc = (trace * trace - 4.0 * det).max(0.0);
-        let l1 = (trace + disc.sqrt()) * 0.5;
-        let l2 = (trace - disc.sqrt()) * 0.5;
-        let e = if l1 > 0.0 { (1.0 - l2 / l1).max(0.0).sqrt() as f32 } else { 0.0 };
-        (t, e)
+    if sf <= 1e-10 {
+        return (0.0, 0.0);
+    }
+    let icx = six / sf;
+    let icy = siy / sf;
+    let mxx = sixx / sf - icx * icx;
+    let myy = siyy / sf - icy * icy;
+    let mxy = sixy / sf - icx * icy;
+    let theta = (0.5 * (2.0 * mxy).atan2(mxx - myy)) as f32;
+    let trace = mxx + myy;
+    let det = mxx * myy - mxy * mxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0);
+    let l1 = (trace + disc.sqrt()) * 0.5;
+    let l2 = (trace - disc.sqrt()) * 0.5;
+    let ecc = if l1 > 0.0 {
+        (1.0 - l2 / l1).max(0.0).sqrt() as f32
     } else {
-        (0.0, 0.0)
+        0.0
     };
-
-    Some(DetectedStar {
-        x: cx,
-        y: cy,
-        peak,
-        flux: flux as f32,
-        area,
-        theta,
-        eccentricity: ecc,
-    })
+    (theta, ecc)
 }
 
 #[cfg(test)]

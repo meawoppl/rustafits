@@ -51,4 +51,10 @@ pub struct ProcessConfig {
     pub auto_stretch: bool,
     /// Output RGBA (4 bytes/pixel) instead of RGB (3 bytes/pixel).
     pub rgba_output: bool,
+    /// Debayer a CFA frame with the full-resolution gradient method
+    /// ([`crate::processing::vng`]) instead of the super-pixel one. Keeps the
+    /// native pixel grid — four times the pixels, and roughly a hundred times
+    /// the debayer cost — so it is opt-in and meant for one frame a user is
+    /// actually looking at, not for bulk conversion.
+    pub vng_debayer: bool,
 }

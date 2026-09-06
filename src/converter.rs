@@ -14,6 +14,7 @@ pub struct ImageConverter {
     apply_debayer: bool,
     preview_mode: bool,
     rgba_output: bool,
+    vng_debayer: bool,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
@@ -25,6 +26,7 @@ impl ImageConverter {
             apply_debayer: true,
             preview_mode: false,
             rgba_output: false,
+            vng_debayer: false,
             thread_pool: None,
         }
     }
@@ -53,6 +55,14 @@ impl ImageConverter {
     /// Output RGBA (4 bytes/pixel) instead of RGB, suitable for HTML Canvas `ImageData`.
     pub fn with_rgba_output(mut self) -> Self {
         self.rgba_output = true;
+        self
+    }
+
+    /// Debayer CFA input at native resolution with the gradient method
+    /// instead of folding 2x2 tiles into single pixels. See
+    /// [`ProcessConfig::vng_debayer`].
+    pub fn with_vng_debayer(mut self) -> Self {
+        self.vng_debayer = true;
         self
     }
 
@@ -102,6 +112,7 @@ impl ImageConverter {
             preview_mode: self.preview_mode,
             auto_stretch: true,
             rgba_output: self.rgba_output,
+            vng_debayer: self.vng_debayer,
         }
     }
 

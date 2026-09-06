@@ -4,7 +4,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::formats;
-use crate::processing::{binning, color, debayer, downscale, stretch};
+use crate::processing::{binning, color, debayer, downscale, stretch, vng};
 use crate::types::{BayerPattern, ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
 
 pub fn process_image(path: &Path, config: &ProcessConfig) -> Result<ProcessedImage> {
@@ -34,11 +34,28 @@ fn process_u16(
     let (float_data, is_color, num_channels);
 
     if config.apply_debayer && meta.bayer_pattern != BayerPattern::None {
-        // Debayer first: u16 mono → f32 planar RGB, half dims (inherent 2x reduction)
-        let (mut rgb, mut ow, mut oh) =
-            debayer::super_pixel_debayer_u16(&data, width, height, meta.bayer_pattern);
-        // Debayer counts as 2x, so only apply additional downscale for factor > 2
-        let extra = config.downscale_factor / 2;
+        // Debayer first: u16 mono → f32 planar RGB.
+        //
+        // The two debayers reduce differently, and that is what `extra` below
+        // is about. Super-pixel folds each 2x2 Bayer tile into one pixel, so it
+        // *is* a 2x downscale and only the remainder of `downscale_factor` is
+        // left to apply. VNG keeps the native grid, so the whole factor still
+        // has to be applied.
+        let (mut rgb, mut ow, mut oh) = if config.vng_debayer {
+            let cfa = color::u16_to_f32(&data);
+            // The u16 plane is dead from here on; release it before VNG
+            // allocates its 12-bytes-per-pixel planar RGB output.
+            drop(std::mem::take(&mut data));
+            let rgb = vng::vng_debayer_f32(&cfa, width, height, meta.bayer_pattern);
+            (rgb, width, height)
+        } else {
+            debayer::super_pixel_debayer_u16(&data, width, height, meta.bayer_pattern)
+        };
+        let extra = if config.vng_debayer {
+            config.downscale_factor
+        } else {
+            config.downscale_factor / 2
+        };
         if extra > 1 {
             let (d, nw, nh) = downscale::downscale_f32_planar(&rgb, ow, oh, 3, extra);
             rgb = d;
@@ -91,11 +108,21 @@ fn process_f32(
     let (float_data, is_color, num_channels);
 
     if meta.channels == 1 && config.apply_debayer && meta.bayer_pattern != BayerPattern::None {
-        // Debayer first: f32 mono → f32 planar RGB, half dims (inherent 2x reduction)
-        let (mut rgb, mut ow, mut oh) =
-            debayer::super_pixel_debayer_f32(&data, width, height, meta.bayer_pattern);
-        // Debayer counts as 2x, so only apply additional downscale for factor > 2
-        let extra = config.downscale_factor / 2;
+        // Debayer first: f32 mono → f32 planar RGB. See `process_u16` for why
+        // `extra` differs between the two debayers.
+        let (mut rgb, mut ow, mut oh) = if config.vng_debayer {
+            let rgb = vng::vng_debayer_f32(&data, width, height, meta.bayer_pattern);
+            // The CFA plane is dead from here on — see `process_u16`.
+            drop(std::mem::take(&mut data));
+            (rgb, width, height)
+        } else {
+            debayer::super_pixel_debayer_f32(&data, width, height, meta.bayer_pattern)
+        };
+        let extra = if config.vng_debayer {
+            config.downscale_factor
+        } else {
+            config.downscale_factor / 2
+        };
         if extra > 1 {
             let (d, nw, nh) = downscale::downscale_f32_planar(&rgb, ow, oh, 3, extra);
             rgb = d;
@@ -290,4 +317,118 @@ fn apply_stretch_and_finalize(
         channels: bpp as u8,
         flip_vertical: meta.flip_vertical,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::{DataType, ImageMetadata, PixelData};
+    use crate::{BayerPattern, ImageConverter};
+
+    fn cfa_meta(w: usize, h: usize, dtype: DataType) -> ImageMetadata {
+        ImageMetadata {
+            width: w,
+            height: h,
+            channels: 1,
+            dtype,
+            bayer_pattern: BayerPattern::Rggb,
+            flip_vertical: false,
+        }
+    }
+
+    /// A CFA ramp: enough structure that the gradient method has something to
+    /// follow, and never uniform (a flat frame stretches to nothing).
+    fn ramp_u16(w: usize, h: usize) -> Vec<u16> {
+        (0..w * h).map(|i| ((i * 37) % 4096) as u16).collect()
+    }
+
+    #[test]
+    fn vng_keeps_native_dimensions() {
+        let (w, h) = (16, 16);
+        let out = ImageConverter::new()
+            .with_vng_debayer()
+            .process_data(
+                cfa_meta(w, h, DataType::Uint16),
+                PixelData::Uint16(ramp_u16(w, h)),
+            )
+            .unwrap();
+
+        assert_eq!((out.width, out.height), (w, h));
+        assert!(out.is_color);
+        assert_eq!(out.channels, 3);
+        assert_eq!(out.data.len(), w * h * 3);
+    }
+
+    #[test]
+    fn superpixel_still_halves_without_the_flag() {
+        let (w, h) = (16, 16);
+        let out = ImageConverter::new()
+            .process_data(
+                cfa_meta(w, h, DataType::Uint16),
+                PixelData::Uint16(ramp_u16(w, h)),
+            )
+            .unwrap();
+
+        assert_eq!((out.width, out.height), (w / 2, h / 2));
+        assert!(out.is_color);
+    }
+
+    /// Super-pixel debayer *is* a 2x reduction, so it consumes half of
+    /// `downscale_factor`. VNG is not, so the whole factor must still apply —
+    /// inheriting the `/2` compensation would silently halve the request.
+    #[test]
+    fn vng_applies_the_full_downscale_factor() {
+        let (w, h) = (16, 16);
+        let vng = ImageConverter::new()
+            .with_vng_debayer()
+            .with_downscale(2)
+            .process_data(
+                cfa_meta(w, h, DataType::Uint16),
+                PixelData::Uint16(ramp_u16(w, h)),
+            )
+            .unwrap();
+        assert_eq!((vng.width, vng.height), (w / 2, h / 2));
+
+        let superpixel = ImageConverter::new()
+            .with_downscale(2)
+            .process_data(
+                cfa_meta(w, h, DataType::Uint16),
+                PixelData::Uint16(ramp_u16(w, h)),
+            )
+            .unwrap();
+        assert_eq!((superpixel.width, superpixel.height), (w / 2, h / 2));
+    }
+
+    #[test]
+    fn vng_covers_the_f32_input_path() {
+        let (w, h) = (16, 16);
+        let data: Vec<f32> = ramp_u16(w, h).into_iter().map(|v| v as f32).collect();
+        let out = ImageConverter::new()
+            .with_vng_debayer()
+            .process_data(
+                cfa_meta(w, h, DataType::Float32),
+                PixelData::Float32(data),
+            )
+            .unwrap();
+
+        assert_eq!((out.width, out.height), (w, h));
+        assert!(out.is_color);
+        assert_eq!(out.channels, 3);
+    }
+
+    /// The gradient method needs a full 5x5 window; a frame smaller than that
+    /// has no interior at all and must fall through to the border pass rather
+    /// than panic.
+    #[test]
+    fn vng_survives_a_frame_smaller_than_its_window() {
+        let (w, h) = (4, 4);
+        let out = ImageConverter::new()
+            .with_vng_debayer()
+            .process_data(
+                cfa_meta(w, h, DataType::Uint16),
+                PixelData::Uint16(ramp_u16(w, h)),
+            )
+            .unwrap();
+
+        assert_eq!((out.width, out.height), (w, h));
+    }
 }

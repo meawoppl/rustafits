@@ -393,10 +393,6 @@ mod tests {
     use super::*;
     use crate::types::BayerPattern;
 
-    /// `formats::xisf` multiplies float samples by this to reach the FITS u16
-    /// range, so a comparison in the file's own [0, 1] units divides it back out.
-    const XISF_FLOAT_SCALE: f64 = 65535.0;
-
     fn cfa_fill(w: usize, h: usize, pattern: BayerPattern, r: f32, g: f32, b: f32) -> Vec<f32> {
         // Fill a mosaic where every R site = r, G site = g, B site = b for `pattern`.
         let (ri, g0, g1, bi) = match pattern {
@@ -559,10 +555,10 @@ mod tests {
     ///   .../debayered/Light_..._CFA_.../2025-09-14_00-55-28..._0000_c_d.xisf
     ///
     /// `read_xisf_image` normalises interleaved samples to planar before
-    /// returning, so both sides are compared plane by plane. It also scales float
-    /// samples by [`XISF_FLOAT_SCALE`] to reach the FITS u16 range, so both sides
-    /// are divided back out and the thresholds below are in the files' own [0, 1]
-    /// units (this frame's mean sits at 6.6e-3 there).
+    /// returning, so both sides are compared plane by plane, in the files'
+    /// own `[0, 1]` units (this frame's mean sits at 6.6e-3 there — see the
+    /// "Root cause" note on `read_xisf_image` for why that reader no longer
+    /// applies a u16-domain scale).
     #[test]
     #[ignore = "needs real reference files via VNG_REF_CAL / VNG_REF_DEB"]
     fn vng_matches_reference_debayer() {
@@ -595,8 +591,8 @@ mod tests {
             let (mut so, mut sr, mut soo, mut srr, mut sor) = (0f64, 0f64, 0f64, 0f64, 0f64);
             for y in 4..h - 4 {
                 for x in 4..w - 4 {
-                    let o = ours[plane * w * h + y * w + x] as f64 / XISF_FLOAT_SCALE;
-                    let r = refi[plane * w * h + y * w + x] as f64 / XISF_FLOAT_SCALE;
+                    let o = ours[plane * w * h + y * w + x] as f64;
+                    let r = refi[plane * w * h + y * w + x] as f64;
                     diffs.push((o - r).abs());
                     so += o;
                     sr += r;

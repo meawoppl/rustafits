@@ -36,6 +36,15 @@ enum XisfLocation {
     Embedded,
 }
 
+/// XISF 1.0 §7.2.2 allows a sample's stored byte order to be declared per
+/// `<Image>` via `byteOrder="big"|"little"`; absent, it defaults to little.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum XisfByteOrder {
+    Little,
+    Big,
+}
+
+#[derive(Clone)]
 struct XisfImageInfo {
     width: usize,
     height: usize,
@@ -51,6 +60,13 @@ struct XisfImageInfo {
     shuffle_item_size: usize,
     bayer_pattern: BayerPattern,
     flip_vertical: bool,
+    byte_order: XisfByteOrder,
+    /// The numeric range `[bounds_lo, bounds_hi]` the stored samples
+    /// represent (XISF 1.0 §7.2.2's `bounds` attribute on `<Image>`,
+    /// float sample formats only). Default `0:1` — the overwhelmingly
+    /// common case, and the identity mapping in `convert_to_float32`.
+    bounds_lo: f32,
+    bounds_hi: f32,
 }
 
 fn parse_sample_format(s: &str) -> XisfSampleFormat {
@@ -77,6 +93,20 @@ fn parse_geometry(s: &str) -> Result<(usize, usize, usize)> {
         1
     };
     Ok((width, height, channels))
+}
+
+/// `bounds="lo:hi"` (XISF 1.0 §7.2.2) — the value range the stored float
+/// samples represent. Malformed input falls back to the default `0:1`
+/// rather than failing the whole header parse.
+fn parse_bounds(s: &str) -> (f32, f32) {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return (0.0, 1.0);
+    }
+    match (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+        (Ok(lo), Ok(hi)) => (lo, hi),
+        _ => (0.0, 1.0),
+    }
 }
 
 fn parse_location(s: &str) -> Result<(XisfLocation, u64, u64)> {
@@ -127,8 +157,8 @@ fn parse_compression(s: &str) -> Result<(XisfCompression, usize, bool, usize)> {
     Ok((compression, uncompressed_size, byte_shuffled, shuffle_item_size))
 }
 
-fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
-    let mut info = XisfImageInfo {
+fn default_image_info() -> XisfImageInfo {
+    XisfImageInfo {
         width: 0,
         height: 0,
         channels: 1,
@@ -143,58 +173,99 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
         shuffle_item_size: 1,
         bayer_pattern: BayerPattern::None,
         flip_vertical: false,
-    };
+        byte_order: XisfByteOrder::Little,
+        bounds_lo: 0.0,
+        bounds_hi: 1.0,
+    }
+}
+
+/// Parse one `<Image>` element's attributes into a fresh `XisfImageInfo`.
+fn parse_image_attrs(e: &quick_xml::events::BytesStart) -> Result<XisfImageInfo> {
+    let mut info = default_image_info();
+    for attr in e.attributes().flatten() {
+        let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+        // XISF headers are XML 1.0; 1.0 and 1.1 normalization differ
+        // only for \x85/\x2028, which cannot appear in these values.
+        let val = attr
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .unwrap_or_default();
+
+        match key {
+            "geometry" => {
+                let (w, h, c) = parse_geometry(&val)?;
+                info.width = w;
+                info.height = h;
+                info.channels = c;
+            }
+            "sampleFormat" => {
+                info.sample_format = parse_sample_format(&val);
+            }
+            "pixelStorage" => {
+                info.is_planar = val.eq_ignore_ascii_case("planar");
+            }
+            "location" => {
+                let (loc, pos, size) = parse_location(&val)?;
+                info.location = loc;
+                info.attachment_pos = pos;
+                info.block_size = size;
+            }
+            "compression" => {
+                let (comp, uncomp_size, shuffled, item_size) = parse_compression(&val)?;
+                info.compression = comp;
+                info.uncompressed_size = uncomp_size;
+                info.byte_shuffled = shuffled;
+                info.shuffle_item_size = item_size;
+            }
+            "byteOrder" => {
+                info.byte_order = if val.eq_ignore_ascii_case("big") {
+                    XisfByteOrder::Big
+                } else {
+                    XisfByteOrder::Little
+                };
+            }
+            "bounds" => {
+                let (lo, hi) = parse_bounds(&val);
+                info.bounds_lo = lo;
+                info.bounds_hi = hi;
+            }
+            _ => {}
+        }
+    }
+    Ok(info)
+}
+
+fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
+    let mut info: Option<XisfImageInfo> = None;
 
     let mut reader = Reader::from_str(xml);
     // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
     // headers are machine-written but a malformed one should still render —
     // cycle decision 2026-07-29).
     reader.config_mut().allow_dangling_amp = true;
-    let mut found_image = false;
 
+    // A header can carry more than one `<Image>` element — a thumbnail
+    // before the real image, or (real-world master files written by the
+    // external tool) a full-size weight map AFTER the actual pixel data,
+    // same geometry. Scan every `<Image>` and keep the one with the
+    // largest `width * height * channels`; a tie keeps whichever was seen
+    // FIRST (not last) — a same-size weight map always follows the real
+    // data in the files this reader has to handle, so "last wins" would
+    // silently swap the light data for its own weight map on every
+    // drizzled/integration master.
     loop {
         match reader.read_event() {
             Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == b"Image" => {
-                found_image = true;
-                for attr in e.attributes().flatten() {
-                    let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                    // XISF headers are XML 1.0; 1.0 and 1.1 normalization differ
-                    // only for \x85/\x2028, which cannot appear in these values.
-                    let val = attr
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .unwrap_or_default();
-
-                    match key {
-                        "geometry" => {
-                            let (w, h, c) = parse_geometry(&val)?;
-                            info.width = w;
-                            info.height = h;
-                            info.channels = c;
-                        }
-                        "sampleFormat" => {
-                            info.sample_format = parse_sample_format(&val);
-                        }
-                        "pixelStorage" => {
-                            info.is_planar = val.eq_ignore_ascii_case("planar");
-                        }
-                        "location" => {
-                            let (loc, pos, size) = parse_location(&val)?;
-                            info.location = loc;
-                            info.attachment_pos = pos;
-                            info.block_size = size;
-                        }
-                        "compression" => {
-                            let (comp, uncomp_size, shuffled, item_size) =
-                                parse_compression(&val)?;
-                            info.compression = comp;
-                            info.uncompressed_size = uncomp_size;
-                            info.byte_shuffled = shuffled;
-                            info.shuffle_item_size = item_size;
-                        }
-                        _ => {}
+                let candidate = parse_image_attrs(e)?;
+                let candidate_size = candidate.width * candidate.height * candidate.channels;
+                let keep = match &info {
+                    None => true,
+                    Some(current) => {
+                        candidate_size > current.width * current.height * current.channels
                     }
+                };
+                if keep {
+                    info = Some(candidate);
                 }
-                break;
             }
             Ok(Event::Eof) => break,
             Err(e) => bail!("XML parse error: {}", e),
@@ -202,9 +273,10 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
         }
     }
 
-    if !found_image {
-        bail!("No <Image> element found in XISF header");
-    }
+    let mut info = match info {
+        Some(info) => info,
+        None => bail!("No <Image> element found in XISF header"),
+    };
 
     if info.width == 0 || info.height == 0 {
         bail!("Invalid XISF image dimensions");
@@ -314,7 +386,23 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
     }
 }
 
-fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
+/// Normalizes a stored float sample against `bounds="lo:hi"` (XISF 1.0
+/// §7.2.2) into `[0, 1]` — the identity mapping for the default `0:1`,
+/// which is what every real file this reader has been checked against
+/// uses. This REPLACES the reader's previous unconditional `* 65535.0`
+/// (see the "Root cause" note on `read_xisf_image` below): degenerate
+/// bounds (`hi == lo`) skip normalization rather than dividing by zero.
+fn bounds_scale(raw: f32, lo: f32, hi: f32) -> f32 {
+    if hi != lo && (lo, hi) != (0.0, 1.0) {
+        (raw - lo) / (hi - lo)
+    } else {
+        raw
+    }
+}
+
+fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat, byte_order: XisfByteOrder, bounds: (f32, f32)) {
+    let big = byte_order == XisfByteOrder::Big;
+    let (bounds_lo, bounds_hi) = bounds;
     match format {
         XisfSampleFormat::Uint8 => {
             // ×257 (not ×256) so 255 maps to 65535, matching the u16 domain
@@ -326,36 +414,36 @@ fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
         }
         XisfSampleFormat::Uint16 => {
             for i in 0..dst.len() {
-                let val = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                let b = [src[i * 2], src[i * 2 + 1]];
+                let val = if big { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) };
                 dst[i] = val as f32;
             }
         }
         XisfSampleFormat::Uint32 => {
             for i in 0..dst.len() {
                 let off = i * 4;
-                let val = u32::from_le_bytes([
-                    src[off], src[off + 1], src[off + 2], src[off + 3],
-                ]);
+                let b = [src[off], src[off + 1], src[off + 2], src[off + 3]];
+                let val = if big { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) };
                 dst[i] = (val >> 16) as f32;
             }
         }
         XisfSampleFormat::Float32 => {
             for i in 0..dst.len() {
                 let off = i * 4;
-                let val = f32::from_le_bytes([
-                    src[off], src[off + 1], src[off + 2], src[off + 3],
-                ]);
-                dst[i] = val * 65535.0;
+                let b = [src[off], src[off + 1], src[off + 2], src[off + 3]];
+                let val = if big { f32::from_be_bytes(b) } else { f32::from_le_bytes(b) };
+                dst[i] = bounds_scale(val, bounds_lo, bounds_hi);
             }
         }
         XisfSampleFormat::Float64 => {
             for i in 0..dst.len() {
                 let off = i * 8;
-                let val = f64::from_le_bytes([
+                let b = [
                     src[off], src[off + 1], src[off + 2], src[off + 3],
                     src[off + 4], src[off + 5], src[off + 6], src[off + 7],
-                ]);
-                dst[i] = (val * 65535.0) as f32;
+                ];
+                let val = if big { f64::from_be_bytes(b) } else { f64::from_le_bytes(b) };
+                dst[i] = bounds_scale(val as f32, bounds_lo, bounds_hi);
             }
         }
     }
@@ -371,6 +459,8 @@ fn convert_to_float32(raw_data: &[u8], info: &XisfImageInfo) -> Vec<f32> {
         XisfSampleFormat::Float64 => 8,
     };
     let format = info.sample_format;
+    let byte_order = info.byte_order;
+    let bounds = (info.bounds_lo, info.bounds_hi);
     const CHUNK: usize = 65536;
     const PAR_THRESHOLD: usize = CHUNK * 2;
 
@@ -378,10 +468,10 @@ fn convert_to_float32(raw_data: &[u8], info: &XisfImageInfo) -> Vec<f32> {
         raw_data.par_chunks(CHUNK * bytes_per_sample)
             .zip(float_data.par_chunks_mut(CHUNK))
             .for_each(|(src, dst)| {
-                convert_chunk(src, dst, format);
+                convert_chunk(src, dst, format, byte_order, bounds);
             });
     } else {
-        convert_chunk(raw_data, &mut float_data, format);
+        convert_chunk(raw_data, &mut float_data, format, byte_order, bounds);
     }
 
     float_data
@@ -426,6 +516,31 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
     *data = temp;
 }
 
+/// Root cause (M4a Task 1) of the disagreement between this reader and a
+/// raw read of a file's own attachment bytes, found while building
+/// `athenaeum-core/examples/weight_audit.rs`: `convert_to_float32` used to
+/// multiply every Float32/Float64 sample by `65535.0` unconditionally,
+/// regardless of `bounds`. That u16-domain scale was added so
+/// `pipeline.rs`'s fixed-`max_input` auto-stretch renders XISF the same as
+/// FITS u16 data — but `pipeline.rs`'s own `unit_range_floats_stretch_like_u16`
+/// test (`processing/stretch.rs`) proves that pipeline is ALREADY invariant
+/// to a uniform rescale of its float input (the `[0, 1]`-domain and
+/// `[0, 65536]`-domain renders of the same image agree to within 3/255),
+/// so the scale was never load-bearing for rendering. It WAS load-bearing
+/// for the wrong reason downstream: `athenaeum_core::stacking::measure`'s
+/// estimators assume calibrated frames are float32 in `[0, 1]`
+/// (`measure::ADU_SCALE`) and apply their own ×65535 internally — reading a
+/// calibrated XISF light through this function and into `measure_plane`
+/// double-scaled every sample (~65535² beyond the true value), which is
+/// exactly what made the external tool's own masters measure as `fwhmPx:
+/// 4.3464` (bit-for-bit the number `docs/superpowers/research/
+/// 2026-09-10-m3-acceptance-run.md` flagged as "not trustworthy") with
+/// `median`/`mad`/`scale` all zeroed (`integration::stats::CLIP_HI ≈ 1.0`
+/// rejects every ADU-domain sample as "out of `[0, 1]`"). The fix: honour
+/// `bounds` (§7.2.2) as the ONLY normalization — identity for the default
+/// `0:1` every real file here uses — so a reader-level Float32 sample is
+/// the file's own value, exactly like the FITS BITPIX `-32` reader already
+/// returns (`formats/fits.rs`, `bzero + bscale * val`, no forced domain).
 pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let file = File::open(path).context("Failed to open XISF file")?;
     let mut reader = BufReader::new(file);
@@ -609,5 +724,206 @@ mod tests {
             err.to_string().contains("size mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A unique scratch path per test process (mirrors `formats/fits.rs`'s
+    /// existing test pattern — no `tempfile` dependency in this crate).
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rustafits_test_{name}_{}_{}.xisf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn write_xisf_header_and_attachments(
+        path: &std::path::Path,
+        image_tags: &[String],
+        attachments: &[(u64, &[u8])],
+    ) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">{}</xisf>"#,
+            image_tags.join(""),
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(XISF_SIGNATURE);
+        bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(xml.as_bytes());
+        for &(pos, data) in attachments {
+            let pos = pos as usize;
+            assert!(
+                bytes.len() <= pos,
+                "fixture attachment offset {pos} overlaps the header/XML (currently {} bytes) — bump the offset",
+                bytes.len()
+            );
+            bytes.resize(pos, 0);
+            bytes.extend_from_slice(data);
+        }
+        std::fs::write(path, bytes).expect("failed to write XISF fixture");
+    }
+
+    fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// A float sample with the default `bounds="0:1"` (every real file this
+    /// reader has been checked against) must come back bit-exact — no
+    /// implicit domain scale. Named (rather than comparing to `values`
+    /// directly) so the fixture assertions below read the same as before
+    /// the M4a fix, which DID apply an unconditional `* 65535.0` here (see
+    /// `read_xisf_image`'s doc comment for why that broke measurement).
+    fn adu_scaled(values: &[f32]) -> Vec<f32> {
+        values.to_vec()
+    }
+
+    /// header: `<Image geometry="4:2:1" .../>` (a 4x2 Gray thumbnail) then
+    /// `<Image geometry="8:4:3" sampleFormat="Float32" colorSpace="RGB"
+    /// pixelStorage="Planar" .../>` (the real data). Real multi-`<Image>`
+    /// masters from the external tool put the weight map (same geometry as
+    /// the data) AFTER the real image, not a smaller thumbnail before it —
+    /// this fixture is the harder case (`read_xisf_image` choosing on size
+    /// alone would need the true winner to be second, matching neither
+    /// "always take the first" nor "always take the last").
+    fn write_two_image_fixture(path: &std::path::Path, main: &[f32]) {
+        assert_eq!(main.len(), 96, "fixture expects 96 main samples (8x4x3)");
+        let thumb_pos: u64 = 4096;
+        let thumb_size: u64 = 32; // 8 samples * 4 bytes
+        let main_pos: u64 = 8192;
+        let main_size: u64 = 384; // 96 samples * 4 bytes
+        let tags = vec![
+            format!(
+                r#"<Image geometry="4:2:1" sampleFormat="Float32" colorSpace="Gray" location="attachment:{thumb_pos}:{thumb_size}"/>"#
+            ),
+            format!(
+                r#"<Image geometry="8:4:3" sampleFormat="Float32" colorSpace="RGB" pixelStorage="Planar" location="attachment:{main_pos}:{main_size}"/>"#
+            ),
+        ];
+        let thumb_data = f32_le_bytes(&[0.0f32; 8]);
+        let main_data = f32_le_bytes(main);
+        write_xisf_header_and_attachments(
+            path,
+            &tags,
+            &[(thumb_pos, &thumb_data), (main_pos, &main_data)],
+        );
+    }
+
+    #[test]
+    fn reads_the_main_image_attachment_bit_exact_when_a_smaller_image_precedes_it() {
+        let path = scratch_path("two_images");
+        let main: Vec<f32> = (0..96).map(|i| i as f32 * 0.001).collect();
+        write_two_image_fixture(&path, &main);
+        let result = read_xisf_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let (meta, pixels) = result.unwrap();
+        assert_eq!((meta.width, meta.height, meta.channels), (8, 4, 3));
+        match pixels {
+            PixelData::Float32(v) => assert_eq!(
+                v,
+                adu_scaled(&main),
+                "the main image's samples must come back bit-exact"
+            ),
+            _ => panic!("Float32 expected"),
+        }
+    }
+
+    /// The real shape found in the external tool's own drizzled masters:
+    /// the light data first, a WEIGHT MAP of the IDENTICAL geometry second
+    /// (`masterLight_..._mono_drizzle_2x.xisf` carries `drizzle_integration`
+    /// then `drizzle_weights`, both `12448:8336:1`). "Largest, ties → last"
+    /// would silently swap the light data for its own weight map on every
+    /// such file — this pins "ties → first" instead.
+    #[test]
+    fn a_same_size_image_following_the_real_data_does_not_win_the_tie() {
+        let path = scratch_path("tied_images");
+        let data_pos: u64 = 4096;
+        let data_size: u64 = 32; // 4x2x1 samples * 4 bytes
+        let weights_pos: u64 = 8192;
+        let weights_size: u64 = 32;
+        let tags = vec![
+            format!(
+                r#"<Image id="drizzle_integration" geometry="4:2:1" sampleFormat="Float32" colorSpace="Gray" location="attachment:{data_pos}:{data_size}"/>"#
+            ),
+            format!(
+                r#"<Image id="drizzle_weights" geometry="4:2:1" sampleFormat="Float32" colorSpace="Gray" location="attachment:{weights_pos}:{weights_size}"/>"#
+            ),
+        ];
+        let data: Vec<f32> = (0..8).map(|i| i as f32 * 0.01).collect();
+        let weights = f32_le_bytes(&[1.0f32; 8]);
+        let data_bytes = f32_le_bytes(&data);
+        write_xisf_header_and_attachments(
+            &path,
+            &tags,
+            &[(data_pos, &data_bytes), (weights_pos, &weights)],
+        );
+        let result = read_xisf_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let (_, pixels) = result.unwrap();
+        match pixels {
+            PixelData::Float32(v) => assert_eq!(
+                v,
+                adu_scaled(&data),
+                "a same-size image following the real data must not replace it"
+            ),
+            _ => panic!("Float32 expected"),
+        }
+    }
+
+    /// XISF 1.0 §7.2.2: `byteOrder="big"` may override the little-endian
+    /// default per `<Image>`.
+    #[test]
+    fn byte_order_big_is_honoured_for_float32_samples() {
+        let path = scratch_path("byte_order_big");
+        let pos: u64 = 4096;
+        let size: u64 = 16; // 4 samples * 4 bytes
+        let tags = vec![format!(
+            r#"<Image geometry="4:1:1" sampleFormat="Float32" colorSpace="Gray" byteOrder="big" location="attachment:{pos}:{size}"/>"#
+        )];
+        let values = [0.1f32, 0.25, 0.5, 0.75];
+        let be_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        write_xisf_header_and_attachments(&path, &tags, &[(pos, &be_bytes)]);
+        let result = read_xisf_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let (_, pixels) = result.unwrap();
+        match pixels {
+            PixelData::Float32(v) => assert_eq!(v, adu_scaled(&values), "big-endian samples must be honoured"),
+            _ => panic!("Float32 expected"),
+        }
+    }
+
+    /// XISF 1.0 §7.2.2: `bounds="lo:hi"` is the value range the stored
+    /// samples represent; a reader must map into `[0, 1]` before any
+    /// further domain scale, not treat the raw stored value as already
+    /// normalized.
+    #[test]
+    fn non_default_bounds_are_rescaled_into_unit_range() {
+        let path = scratch_path("bounds");
+        let pos: u64 = 4096;
+        let size: u64 = 16; // 4 samples * 4 bytes
+        let tags = vec![format!(
+            r#"<Image geometry="4:1:1" sampleFormat="Float32" colorSpace="Gray" bounds="-1:1" location="attachment:{pos}:{size}"/>"#
+        )];
+        // Stored in [-1, 1]; expected normalized values are (stored+1)/2.
+        let stored = [-1.0f32, -0.5, 0.0, 1.0];
+        let stored_bytes = f32_le_bytes(&stored);
+        write_xisf_header_and_attachments(&path, &tags, &[(pos, &stored_bytes)]);
+        let result = read_xisf_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let (_, pixels) = result.unwrap();
+        let expected = adu_scaled(&[0.0f32, 0.25, 0.5, 1.0]);
+        match pixels {
+            PixelData::Float32(v) => {
+                for (got, want) in v.iter().zip(expected.iter()) {
+                    assert!(
+                        (got - want).abs() < 1e-2,
+                        "bounds-normalized value mismatch: got {got}, want {want}"
+                    );
+                }
+            }
+            _ => panic!("Float32 expected"),
+        }
     }
 }

@@ -44,7 +44,7 @@ enum XisfByteOrder {
     Big,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct XisfImageInfo {
     width: usize,
     height: usize,
@@ -252,10 +252,22 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
     // data in the files this reader has to handle, so "last wins" would
     // silently swap the light data for its own weight map on every
     // drizzled/integration master.
+    // A candidate `<Image>` element can itself fail to parse (an
+    // unsupported `location` scheme, an unknown compression codec, …) —
+    // that must not fail the WHOLE header read when another `<Image>`
+    // element is fine; skip it and remember the first error only in case
+    // nothing usable turns up at all.
+    let mut first_err: Option<anyhow::Error> = None;
     loop {
         match reader.read_event() {
             Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == b"Image" => {
-                let candidate = parse_image_attrs(e)?;
+                let candidate = match parse_image_attrs(e) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        first_err.get_or_insert(err);
+                        continue;
+                    }
+                };
                 let candidate_size = candidate.width * candidate.height * candidate.channels;
                 let keep = match &info {
                     None => true,
@@ -275,7 +287,10 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
 
     let mut info = match info {
         Some(info) => info,
-        None => bail!("No <Image> element found in XISF header"),
+        None => match first_err {
+            Some(err) => return Err(err),
+            None => bail!("No <Image> element found in XISF header"),
+        },
     };
 
     if info.width == 0 || info.height == 0 {
@@ -403,6 +418,22 @@ fn bounds_scale(raw: f32, lo: f32, hi: f32) -> f32 {
     normalized * 65535.0
 }
 
+/// As `bounds_scale`, but for `Float64` samples: normalize and scale in
+/// f64 throughout, casting to f32 only once at the very end. Casting the
+/// raw f64 sample down to f32 BEFORE normalizing/scaling (two roundings)
+/// is not bit-identical to the pre-M4a reader, which always did this
+/// arithmetic in f64 — a subnormal value in particular can round to
+/// exactly `0.0` after an extra intermediate f32 cast where a single
+/// final cast would not.
+fn bounds_scale_f64(raw: f64, lo: f64, hi: f64) -> f32 {
+    let normalized = if hi != lo && (lo, hi) != (0.0, 1.0) {
+        (raw - lo) / (hi - lo)
+    } else {
+        raw
+    };
+    (normalized * 65535.0) as f32
+}
+
 fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat, byte_order: XisfByteOrder, bounds: (f32, f32)) {
     let big = byte_order == XisfByteOrder::Big;
     let (bounds_lo, bounds_hi) = bounds;
@@ -446,7 +477,7 @@ fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat, byte_ord
                     src[off + 4], src[off + 5], src[off + 6], src[off + 7],
                 ];
                 let val = if big { f64::from_be_bytes(b) } else { f64::from_le_bytes(b) };
-                dst[i] = bounds_scale(val as f32, bounds_lo, bounds_hi);
+                dst[i] = bounds_scale_f64(val, bounds_lo as f64, bounds_hi as f64);
             }
         }
     }
@@ -932,5 +963,82 @@ mod tests {
             }
             _ => panic!("Float32 expected"),
         }
+    }
+
+    /// A candidate `<Image>` that fails to parse (an unsupported
+    /// `location` scheme here) must not fail the whole header when
+    /// another `<Image>` element parses fine.
+    #[test]
+    fn an_unparsable_image_element_is_skipped_not_fatal() {
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">"#,
+            r#"<Image geometry="4:2:1" sampleFormat="Float32" colorSpace="Gray" location="attachment:4096:32"/>"#,
+            r#"<Image geometry="4:2:1" sampleFormat="Float32" location="path:foo.dat"/>"#,
+            r#"</xisf>"#,
+        );
+        let info = parse_xisf_xml(xml)
+            .expect("a later un-parsable <Image> must not fail the whole header parse");
+        assert_eq!((info.width, info.height, info.channels), (4, 2, 1));
+        assert_eq!(info.attachment_pos, 4096, "must have picked the parsable image");
+    }
+
+    /// When the ONLY `<Image>` element fails to parse, the header read
+    /// must still error (not silently succeed with no image).
+    #[test]
+    fn a_header_whose_only_image_is_unparsable_errors() {
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">"#,
+            r#"<Image geometry="4:2:1" sampleFormat="Float32" location="path:foo.dat"/>"#,
+            r#"</xisf>"#,
+        );
+        let err = parse_xisf_xml(xml)
+            .expect_err("a header whose only <Image> can't be parsed must error");
+        assert!(
+            err.to_string().contains("Unsupported XISF location"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `Float64` samples must be normalized/scaled in f64 throughout and
+    /// cast to f32 only once at the end — casting to f32 before the
+    /// arithmetic (two roundings) is not bit-identical to the
+    /// pre-existing reader.
+    #[test]
+    fn float64_samples_keep_f64_arithmetic_until_the_final_cast() {
+        let path = scratch_path("float64_precision");
+        let pos: u64 = 4096;
+        let size: u64 = 8; // 1 sample * 8 bytes
+        let tags = vec![format!(
+            r#"<Image geometry="1:1:1" sampleFormat="Float64" colorSpace="Gray" location="attachment:{pos}:{size}"/>"#
+        )];
+        let stored: f64 = 0.123456789012345;
+        let bytes = stored.to_le_bytes().to_vec();
+        write_xisf_header_and_attachments(&path, &tags, &[(pos, &bytes)]);
+        let result = read_xisf_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let (_, pixels) = result.unwrap();
+        let expected = (stored * 65535.0) as f32;
+        match pixels {
+            PixelData::Float32(v) => assert_eq!(
+                v[0], expected,
+                "Float64 sample must scale in f64 arithmetic, one final cast"
+            ),
+            _ => panic!("Float32 expected"),
+        }
+    }
+
+    /// A header with zero `<Image>` elements must error (the pin the
+    /// M4a Task 1 review flagged as untested).
+    #[test]
+    fn a_header_with_no_image_elements_errors() {
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">"#,
+            r#"</xisf>"#,
+        );
+        let err = parse_xisf_xml(xml).expect_err("a header with zero <Image> elements must error");
+        assert!(
+            err.to_string().contains("No <Image> element found"),
+            "unexpected error: {err}"
+        );
     }
 }

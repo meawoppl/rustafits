@@ -112,6 +112,25 @@ pub(crate) fn background_and_noise(
     (backgr, sd.max(1e-6))
 }
 
+/// How the two detection levels the falling-threshold ladder starts from
+/// are chosen. `RankBudget` is the historical rule (levels at the
+/// intensities below which `6·max_stars` and `24·max_stars` brightest
+/// pixels lie — a fixed bright-pixel budget, blind to sky brightness);
+/// `NoiseRelative` puts them at `background + k·noise`.
+///
+/// The two are not just different numbers: `RankBudget` keeps the full
+/// four-arm ladder (both budget levels, then a fixed `30·noise` peak level,
+/// then a per-tile adaptive pass), which descends until `max_stars` stars
+/// are found. `NoiseRelative` runs ONLY the two requested levels — the
+/// deeper arms would refill the population up to the cap and undo the
+/// caller's threshold choice.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DetectionLevels {
+    #[default]
+    RankBudget,
+    NoiseRelative { k1: f32, k2: f32 },
+}
+
 /// Count-driven `star_level` / `star_level2` with the saturation-aware clip.
 /// Levels are picked so the brightest ~`6·max_stars` / `24·max_stars` pixels
 /// fall above them, then pulled below the saturation ceiling (`− bg − 1`) so
@@ -449,6 +468,7 @@ pub fn detect_stars_adaptive(
     height: usize,
     max_stars: usize,
     hfd_min: f32,
+    levels: DetectionLevels,
 ) -> Vec<(DetectedStar, f32)> {
     if width < 8 || height < 8 {
         return Vec::new();
@@ -458,17 +478,39 @@ pub fn detect_stars_adaptive(
     // ladder levels, only there to bound memory on pathological input.
     let scan_budget = (max_stars * 64).max(8192);
     let (bg, noise) = background_and_noise(lum, width, height);
-    let (star_level, star_level2) = star_levels(lum, bg, noise, max_stars);
+    // `scan_region` compares `lum[i] - bg` against its level, so both
+    // arms below are ABOVE-background levels: `k·noise` here is the
+    // absolute level `bg + k·noise`. No saturation clip is needed on the
+    // noise-relative arm — a few-σ level can never land above the
+    // saturation ceiling the way a rank-derived one can.
+    let (star_level, star_level2) = match levels {
+        DetectionLevels::RankBudget => star_levels(lum, bg, noise, max_stars),
+        DetectionLevels::NoiseRelative { k1, k2 } => (k1 * noise, k2 * noise),
+    };
 
     let mut mask = vec![0u8; width * height];
     let mut stars: Vec<Star> = Vec::with_capacity(max_stars);
 
     // retries 4 → 1, stop once we have enough or the ladder is exhausted.
+    // `NoiseRelative` stops after the two caller-chosen arms (4 and 3): the
+    // fixed `30·noise` arm and the per-tile adaptive pass exist to keep
+    // descending until `max_stars` is reached, which would refill the
+    // population regardless of the threshold the caller asked for.
+    let deepest = match levels {
+        DetectionLevels::RankBudget => 1i32,
+        DetectionLevels::NoiseRelative { .. } => 3i32,
+    };
     let mut retries = 4i32;
-    while retries >= 1 && stars.len() < max_stars {
+    while retries >= deepest && stars.len() < max_stars {
         match retries {
             4 => {
-                if star_level > 30.0 * noise {
+                // The `> 30·noise` guard is the rank-budget ladder's own:
+                // a budget level that low means the budget already reaches
+                // the noise, and arm 2's fixed level covers it. A
+                // caller-chosen noise-relative level is never skipped.
+                if star_level > 30.0 * noise
+                    || matches!(levels, DetectionLevels::NoiseRelative { .. })
+                {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg, star_level,
                         noise, hfd_min, &mut mask, &mut stars, scan_budget,
@@ -476,7 +518,9 @@ pub fn detect_stars_adaptive(
                 }
             }
             3 => {
-                if star_level2 > 30.0 * noise {
+                if star_level2 > 30.0 * noise
+                    || matches!(levels, DetectionLevels::NoiseRelative { .. })
+                {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg,
                         star_level2, noise, hfd_min, &mut mask, &mut stars,
@@ -661,7 +705,14 @@ mod tests {
         }
 
         let max_stars = 24;
-        let stars = detect_stars_adaptive(&data, width, height, max_stars, 1.0);
+        let stars = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::RankBudget,
+        );
         assert!(stars.len() >= 16, "expected detections, got {}", stars.len());
         let bright_bottom = stars.iter().filter(|(s, _)| s.y > 470.0).count();
         assert!(
@@ -671,6 +722,101 @@ mod tests {
             stars.len(),
             stars.iter().map(|(s, _)| s.y).fold(f32::MAX, f32::min),
             stars.iter().map(|(s, _)| s.y).fold(f32::MIN, f32::max),
+        );
+    }
+
+    /// The caller-chosen levels must actually decide the population: at
+    /// `5σ`/`2.5σ` both the bright and the faint half of a synthetic field
+    /// are found; at `20σ`/`10σ` the faint half sits below both levels and
+    /// only the bright half survives. `RankBudget` with a budget larger
+    /// than the field reproduces the deep answer, which is exactly the
+    /// sky-blind behaviour `NoiseRelative` exists to replace.
+    #[test]
+    fn noise_relative_levels_decide_the_population() {
+        let (width, height) = (512usize, 512usize);
+        let mut data = vec![1000.0_f32; width * height];
+        // 20×20 grid: alternate bright (peak 300) and faint (peak 60)
+        // stars, 200 of each, well clear of the borders.
+        let mut bright = 0;
+        let mut faint = 0;
+        for gy in 0..20 {
+            for gx in 0..20 {
+                let x = 16.0 + gx as f32 * 24.0;
+                let y = 16.0 + gy as f32 * 24.0;
+                if (gx + gy) % 2 == 0 {
+                    add_star(&mut data, width, x, y, 300.0, 1.6);
+                    bright += 1;
+                } else {
+                    add_star(&mut data, width, x, y, 60.0, 1.6);
+                    faint += 1;
+                }
+            }
+        }
+        assert_eq!((bright, faint), (200, 200));
+        // Deterministic Gaussian-ish noise, σ = 8 ADU (sum of 4 uniforms,
+        // whose own σ is 1/√12 per term). σ has to leave the FAINT half
+        // above the detector's OWN accept gate (`snr > 10` on the aperture
+        // flux) — at σ = 20 a peak-60 star scores ≈ 6 and never survives
+        // any level, so the fixture would test the gate, not the levels.
+        const NOISE: f32 = 8.0;
+        let mut rng = 987_654_321u64;
+        for v in data.iter_mut() {
+            let mut acc = 0.0f32;
+            for _ in 0..4 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                acc += (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            }
+            *v += acc * NOISE / (1.0 / 12.0f32 * 4.0).sqrt();
+        }
+
+        let max_stars = 24576;
+        let deep = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::NoiseRelative { k1: 5.0, k2: 2.5 },
+        );
+        assert!(
+            deep.len() >= 380,
+            "5σ/2.5σ should reach the faint half: {}",
+            deep.len()
+        );
+
+        let shallow = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::NoiseRelative { k1: 20.0, k2: 10.0 },
+        );
+        assert!(
+            shallow.len() <= 220,
+            "20σ/10σ is above the faint half's peak: {}",
+            shallow.len()
+        );
+        assert!(
+            shallow.len() >= 150,
+            "20σ/10σ must still find the bright half: {}",
+            shallow.len()
+        );
+
+        // The rank budget is blind to the caller's threshold: a budget
+        // larger than the whole field puts both its levels at the noise
+        // floor and the ladder's deeper arms run anyway, so it lands near
+        // the DEEP answer no matter what threshold a caller wanted (331 of
+        // 400 as measured — the per-tile arm's own local-noise estimate is
+        // inflated inside the star-dense tiles, which costs the rest).
+        let budget =
+            detect_stars_adaptive(&data, width, height, max_stars, 1.0, DetectionLevels::RankBudget);
+        assert!(
+            budget.len() >= 300 && budget.len() > shallow.len(),
+            "the budget ladder descends past the faint half regardless of any \
+             threshold: {} (shallow {})",
+            budget.len(),
+            shallow.len()
         );
     }
 }
@@ -686,7 +832,8 @@ mod diag {
         if !std::path::Path::new(path).exists() { return; }
         let (meta, pixels) = crate::formats::read_image(std::path::Path::new(path)).unwrap();
         let (lum, w, h, _, _) = crate::analysis::prepare_luminance(&meta, &pixels, true);
-        let stars = detect_stars_adaptive(&lum, w, h, 8000, 0.8);
+        let stars =
+            detect_stars_adaptive(&lum, w, h, 8000, 0.8, DetectionLevels::RankBudget);
         eprintln!("total {}", stars.len());
         eprintln!("top 25 by flux (x y flux area~hfd2 snr):");
         for (s, snr) in stars.iter().take(25) {

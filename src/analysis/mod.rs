@@ -10,8 +10,11 @@ pub mod convolution;
 #[cfg(not(feature = "debug-pipeline"))]
 mod convolution;
 
-// Adaptive multi-level detector used by plate solving. Internal.
+// Adaptive multi-level detector used by plate solving. Internal apart
+// from `DetectionLevels`, which callers pick through
+// `ImageAnalyzer::with_detection_levels`.
 mod adaptive_detection;
+pub use adaptive_detection::DetectionLevels;
 
 #[cfg(feature = "debug-pipeline")]
 pub mod detection;
@@ -309,6 +312,9 @@ pub struct AnalysisConfig {
     /// detection and update `FastStar.{x, y, sx, sy, fwhm}`. Default `false`.
     /// The pass is skipped entirely when `false` — byte-identical output.
     centroid_refine: bool,
+    /// How the fast detector picks its two ladder levels. Default
+    /// [`DetectionLevels::RankBudget`] — the historical behaviour.
+    detection_levels: DetectionLevels,
 }
 
 /// Image analyzer with builder pattern.
@@ -336,6 +342,7 @@ impl ImageAnalyzer {
                 focal_length_mm: None,
                 pixel_size_um: None,
                 centroid_refine: false,
+                detection_levels: DetectionLevels::RankBudget,
             },
             thread_pool: None,
         }
@@ -450,6 +457,24 @@ impl ImageAnalyzer {
     /// entirely — output is byte-identical to the pre-refinement path.
     pub fn with_centroid_refine(mut self, refine: bool) -> Self {
         self.config.centroid_refine = refine;
+        self
+    }
+
+    /// How the fast detection path picks the two levels its
+    /// falling-threshold ladder starts from.
+    ///
+    /// [`DetectionLevels::RankBudget`] (the default) is the historical
+    /// rule: a fixed bright-pixel budget derived from `max_stars`, blind
+    /// to sky brightness, followed by the deeper `30·noise` and per-tile
+    /// arms until the cap is reached. [`DetectionLevels::NoiseRelative`]
+    /// puts the two levels at `background + k·noise` and runs only those
+    /// two arms, so the detected population is set by the caller's
+    /// threshold instead of by a star-count budget.
+    ///
+    /// Only [`Self::detect_fast_data`] / [`Self::detect_fast`] read this —
+    /// the full [`Self::analyze`] pipeline has its own detector.
+    pub fn with_detection_levels(mut self, levels: DetectionLevels) -> Self {
+        self.config.detection_levels = levels;
         self
     }
 
@@ -1266,6 +1291,7 @@ impl ImageAnalyzer {
             height,
             self.config.max_stars,
             0.8,
+            self.config.detection_levels,
         );
         let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
         let detected_count = detected.len();

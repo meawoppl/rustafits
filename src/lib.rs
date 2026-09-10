@@ -15,8 +15,8 @@ pub mod processing;
 mod types;
 
 pub use analysis::{
-    AnalysisConfig, AnalysisResult, FastAnalysisResult, FastDetectTiming, FastStar, FitMethod,
-    ImageAnalyzer, StageTiming, StarMetrics,
+    AnalysisConfig, AnalysisResult, DetectionLevels, FastAnalysisResult, FastDetectTiming,
+    FastStar, FitMethod, ImageAnalyzer, StageTiming, StarMetrics,
 };
 pub use annotate::{
     annotate_image, compute_annotations, create_annotation_layer, AnnotationConfig, ColorScheme,

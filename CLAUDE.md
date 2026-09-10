@@ -58,21 +58,23 @@ Pipeline flow for u16 data:
 
 - **PixelData**: `Uint16(Vec<u16>) | Float32(Vec<f32>)` — owns allocations, no raw pointers
 - **Planar f32**: channels stored contiguously as RRRGGGBBB (not interleaved)
-- XISF float32 samples are normalized against `bounds="lo:hi"` (identity for
-  the default `0:1`) and returned in the file's OWN native units — the same
-  contract the FITS BITPIX `-32` reader has always had (`bzero + bscale *
-  val`, no forced domain). A caller that needs the u16-like ADU domain
-  (SIMD stretch tables, saturation floors tuned in that domain, …) scales
-  itself; `formats::xisf::read_xisf_image` used to bake in an unconditional
-  `* 65535.0` for every float sample instead — removed in the M4a stacking
-  cycle (2026-09-10) once `processing::stretch`'s own
-  `unit_range_floats_stretch_like_u16` test showed the auto-stretch pipeline
-  is already invariant to a uniform rescale of its float input, so the old
-  multiply was never load-bearing for rendering; it WAS silently
-  double-scaling every calibrated XISF frame read through
-  `athenaeum-core::stacking::measure` (which assumes `[0, 1]` and applies
-  its own ADU scale) — see `read_xisf_image`'s doc comment for the full
-  chain of evidence.
+- XISF float32 [0,1] is scaled by 65535 to match FITS u16 range, after
+  `bounds="lo:hi"` normalization (identity for the default `0:1`); multi-
+  `<Image>` headers resolve to the largest image, ties to the first. This
+  is a PRODUCTION CONTRACT, not just a rendering convenience —
+  `athenaeum-core`'s `integration::banded::spill_via_read_raw` (master
+  builds, light calibration) and `analysis::analyzer::analyze_frame` both
+  take `PixelData::Float32` straight into ADU-domain code with no rescale
+  of their own, so removing this scale silently breaks them (a 65535×-too-
+  small master; a detector that finds nothing) even though
+  `processing::stretch`'s auto-stretch is separately provably invariant to
+  a uniform rescale of its float input (`unit_range_floats_stretch_like_u16`).
+  A caller that wants the file's own native units (M4a's
+  `stacking::measure`, which assumes calibrated frames are float32 in
+  `[0, 1]`) divides by 65535 itself — see `read_xisf_image`'s doc comment
+  (M4a Task 1, controller ruling R-M4a-11) for the full chain of evidence,
+  including the one-time attempt to remove this scale and why it was
+  reverted.
 
 ### Module Map
 

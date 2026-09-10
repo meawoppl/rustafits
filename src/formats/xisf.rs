@@ -387,17 +387,20 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
 }
 
 /// Normalizes a stored float sample against `bounds="lo:hi"` (XISF 1.0
-/// §7.2.2) into `[0, 1]` — the identity mapping for the default `0:1`,
-/// which is what every real file this reader has been checked against
-/// uses. This REPLACES the reader's previous unconditional `* 65535.0`
-/// (see the "Root cause" note on `read_xisf_image` below): degenerate
-/// bounds (`hi == lo`) skip normalization rather than dividing by zero.
+/// §7.2.2) into `[0, 1]` — identity for the default `0:1`, which is what
+/// every real file this reader has been checked against uses — THEN
+/// applies the u16-like ADU-domain scale every sample format in this
+/// reader has always produced (see the "Convention" note on
+/// `read_xisf_image` below for why that second step is load-bearing and
+/// must not be removed). Degenerate bounds (`hi == lo`) skip
+/// normalization rather than dividing by zero.
 fn bounds_scale(raw: f32, lo: f32, hi: f32) -> f32 {
-    if hi != lo && (lo, hi) != (0.0, 1.0) {
+    let normalized = if hi != lo && (lo, hi) != (0.0, 1.0) {
         (raw - lo) / (hi - lo)
     } else {
         raw
-    }
+    };
+    normalized * 65535.0
 }
 
 fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat, byte_order: XisfByteOrder, bounds: (f32, f32)) {
@@ -516,31 +519,37 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
     *data = temp;
 }
 
-/// Root cause (M4a Task 1) of the disagreement between this reader and a
-/// raw read of a file's own attachment bytes, found while building
-/// `athenaeum-core/examples/weight_audit.rs`: `convert_to_float32` used to
-/// multiply every Float32/Float64 sample by `65535.0` unconditionally,
-/// regardless of `bounds`. That u16-domain scale was added so
-/// `pipeline.rs`'s fixed-`max_input` auto-stretch renders XISF the same as
-/// FITS u16 data — but `pipeline.rs`'s own `unit_range_floats_stretch_like_u16`
-/// test (`processing/stretch.rs`) proves that pipeline is ALREADY invariant
-/// to a uniform rescale of its float input (the `[0, 1]`-domain and
-/// `[0, 65536]`-domain renders of the same image agree to within 3/255),
-/// so the scale was never load-bearing for rendering. It WAS load-bearing
-/// for the wrong reason downstream: `athenaeum_core::stacking::measure`'s
+/// Convention (M4a Task 1, controller ruling R-M4a-11): every Float32 or
+/// Float64 sample this reader returns is in the u16-like ADU domain —
+/// `bounds`-normalized to `[0, 1]` THEN multiplied by `65535.0` — the same
+/// domain the FITS u16 reader's raw counts are naturally in. This is a
+/// PRODUCTION CONTRACT, not just a rendering convenience: `athenaeum-core`'s
+/// `integration::banded::spill_via_read_raw` (master builds, light
+/// calibration) spills `PixelData::Float32` straight into its ADU-domain
+/// band scratch, and `analysis::analyzer::analyze_frame` hands it straight
+/// to a detector whose thresholds (`star_levels`, `saturation_limit`) are
+/// ADU-domain by construction — either consumer fed a native-`[0, 1]` XISF
+/// float would be silently wrong (a 65535×-too-small master; a detector
+/// that finds nothing). A one-time attempt to remove this scale (M4a Task 1,
+/// commit `b7d1d306`) broke nothing in THIS crate's own tests — its
+/// `pipeline.rs`'s auto-stretch is provably invariant to a uniform rescale
+/// of its float input (see `processing/stretch.rs`'s
+/// `unit_range_floats_stretch_like_u16` test) — but was wrong at the
+/// `athenaeum-core` call sites above, so it was reverted; DO NOT remove it
+/// again without auditing every `ImageConverter::read_raw`/`read_xisf_image`
+/// caller across both crates.
+///
+/// What WAS the actual bug behind the external tool's own masters measuring
+/// at `fwhmPx: 4.3464` (`docs/superpowers/research/2026-09-10-m3-acceptance-run.md`
+/// finding 1, "not trustworthy"): `athenaeum_core::stacking::measure`'s
 /// estimators assume calibrated frames are float32 in `[0, 1]`
-/// (`measure::ADU_SCALE`) and apply their own ×65535 internally — reading a
-/// calibrated XISF light through this function and into `measure_plane`
-/// double-scaled every sample (~65535² beyond the true value), which is
-/// exactly what made the external tool's own masters measure as `fwhmPx:
-/// 4.3464` (bit-for-bit the number `docs/superpowers/research/
-/// 2026-09-10-m3-acceptance-run.md` flagged as "not trustworthy") with
-/// `median`/`mad`/`scale` all zeroed (`integration::stats::CLIP_HI ≈ 1.0`
-/// rejects every ADU-domain sample as "out of `[0, 1]`"). The fix: honour
-/// `bounds` (§7.2.2) as the ONLY normalization — identity for the default
-/// `0:1` every real file here uses — so a reader-level Float32 sample is
-/// the file's own value, exactly like the FITS BITPIX `-32` reader already
-/// returns (`formats/fits.rs`, `bzero + bscale * val`, no forced domain).
+/// (`measure::ADU_SCALE`) and apply their OWN ×65535 internally — a caller
+/// (`measure_probe.rs`'s XISF branch, and the ORIGINAL `weight_audit.rs`
+/// skeleton) that passes this reader's ADU-domain Float32 straight into
+/// `measure_plane`/`measure_plane_with_seeds` without dividing by 65535
+/// first double-scales every sample. The fix belongs at THOSE call sites
+/// (divide by 65535 before measuring, mirroring how they already divide a
+/// `Uint16` result), not in this reader.
 pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let file = File::open(path).context("Failed to open XISF file")?;
     let mut reader = BufReader::new(file);
@@ -770,14 +779,12 @@ mod tests {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// A float sample with the default `bounds="0:1"` (every real file this
-    /// reader has been checked against) must come back bit-exact — no
-    /// implicit domain scale. Named (rather than comparing to `values`
-    /// directly) so the fixture assertions below read the same as before
-    /// the M4a fix, which DID apply an unconditional `* 65535.0` here (see
-    /// `read_xisf_image`'s doc comment for why that broke measurement).
+    /// The reader's u16-like ADU-domain convention (R-M4a-11): a stored
+    /// float sample with the default `bounds="0:1"` comes back multiplied
+    /// by 65535 — computed here, not written as literals, so the fixture
+    /// assertions below stay correct if the scale constant ever changes.
     fn adu_scaled(values: &[f32]) -> Vec<f32> {
-        values.to_vec()
+        values.iter().map(|v| v * 65535.0).collect()
     }
 
     /// header: `<Image geometry="4:2:1" .../>` (a 4x2 Gray thumbnail) then

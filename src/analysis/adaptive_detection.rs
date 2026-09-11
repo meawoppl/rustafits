@@ -116,19 +116,28 @@ pub(crate) fn background_and_noise(
 /// are chosen. `RankBudget` is the historical rule (levels at the
 /// intensities below which `6·max_stars` and `24·max_stars` brightest
 /// pixels lie — a fixed bright-pixel budget, blind to sky brightness);
-/// `NoiseRelative` puts them at `background + k·noise`.
+/// `NoiseRelative` puts them at `background + k·noise`, with `noise`
+/// measured on the data this detector was handed; `Absolute` takes the two
+/// levels from the caller verbatim, in ADU above background.
 ///
-/// The two are not just different numbers: `RankBudget` keeps the full
+/// The three are not just different numbers: `RankBudget` keeps the full
 /// four-arm ladder (both budget levels, then a fixed `30·noise` peak level,
 /// then a per-tile adaptive pass), which descends until `max_stars` stars
-/// are found. `NoiseRelative` runs ONLY the two requested levels — the
-/// deeper arms would refill the population up to the cap and undo the
-/// caller's threshold choice.
+/// are found. The two caller-chosen variants run ONLY the two requested
+/// levels — the deeper arms would refill the population up to the cap and
+/// undo the caller's threshold choice.
+///
+/// `Absolute` exists for a caller that pre-filters the image it hands in:
+/// a filter that attenuates stars usually attenuates the noise as well, so
+/// a level derived from the FILTERED data moves with the stars and the
+/// filter cancels itself. Such a caller measures the noise on the original
+/// and passes the levels it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum DetectionLevels {
     #[default]
     RankBudget,
     NoiseRelative { k1: f32, k2: f32 },
+    Absolute { above_bg_1: f32, above_bg_2: f32 },
 }
 
 /// Count-driven `star_level` / `star_level2` with the saturation-aware clip.
@@ -486,20 +495,23 @@ pub fn detect_stars_adaptive(
     let (star_level, star_level2) = match levels {
         DetectionLevels::RankBudget => star_levels(lum, bg, noise, max_stars),
         DetectionLevels::NoiseRelative { k1, k2 } => (k1 * noise, k2 * noise),
+        DetectionLevels::Absolute {
+            above_bg_1,
+            above_bg_2,
+        } => (above_bg_1, above_bg_2),
     };
+    // Both caller-chosen variants run the two requested arms and stop.
+    let caller_levels = !matches!(levels, DetectionLevels::RankBudget);
 
     let mut mask = vec![0u8; width * height];
     let mut stars: Vec<Star> = Vec::with_capacity(max_stars);
 
     // retries 4 → 1, stop once we have enough or the ladder is exhausted.
-    // `NoiseRelative` stops after the two caller-chosen arms (4 and 3): the
-    // fixed `30·noise` arm and the per-tile adaptive pass exist to keep
+    // A caller-chosen level stops after the two arms it asked for (4 and 3):
+    // the fixed `30·noise` arm and the per-tile adaptive pass exist to keep
     // descending until `max_stars` is reached, which would refill the
     // population regardless of the threshold the caller asked for.
-    let deepest = match levels {
-        DetectionLevels::RankBudget => 1i32,
-        DetectionLevels::NoiseRelative { .. } => 3i32,
-    };
+    let deepest = if caller_levels { 3i32 } else { 1i32 };
     let mut retries = 4i32;
     while retries >= deepest && stars.len() < max_stars {
         match retries {
@@ -507,10 +519,8 @@ pub fn detect_stars_adaptive(
                 // The `> 30·noise` guard is the rank-budget ladder's own:
                 // a budget level that low means the budget already reaches
                 // the noise, and arm 2's fixed level covers it. A
-                // caller-chosen noise-relative level is never skipped.
-                if star_level > 30.0 * noise
-                    || matches!(levels, DetectionLevels::NoiseRelative { .. })
-                {
+                // caller-chosen level is never skipped.
+                if star_level > 30.0 * noise || caller_levels {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg, star_level,
                         noise, hfd_min, &mut mask, &mut stars, scan_budget,
@@ -518,9 +528,7 @@ pub fn detect_stars_adaptive(
                 }
             }
             3 => {
-                if star_level2 > 30.0 * noise
-                    || matches!(levels, DetectionLevels::NoiseRelative { .. })
-                {
+                if star_level2 > 30.0 * noise || caller_levels {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg,
                         star_level2, noise, hfd_min, &mut mask, &mut stars,
@@ -801,6 +809,61 @@ mod tests {
             shallow.len() >= 150,
             "20σ/10σ must still find the bright half: {}",
             shallow.len()
+        );
+
+        // `Absolute` takes the caller's two levels verbatim, in ADU above
+        // background — nothing is multiplied by the detector's own noise.
+        // 200/100 sits between the faint half's peak (60) and the bright
+        // half's (300); 40/20 is under both.
+        let bright_only = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::Absolute {
+                above_bg_1: 200.0,
+                above_bg_2: 100.0,
+            },
+        );
+        assert!(
+            bright_only.len() <= 220 && bright_only.len() >= 150,
+            "an absolute 200/100 level keeps the bright half only: {}",
+            bright_only.len()
+        );
+        let both = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::Absolute {
+                above_bg_1: 40.0,
+                above_bg_2: 20.0,
+            },
+        );
+        assert!(
+            both.len() >= 380,
+            "an absolute 40/20 level reaches the faint half: {}",
+            both.len()
+        );
+        // And with NOISE = 8 the two spellings agree: `Absolute{5σ, 2.5σ}`
+        // is exactly what `NoiseRelative{5, 2.5}` computes for itself.
+        assert_eq!(
+            deep.len(),
+            detect_stars_adaptive(
+                &data,
+                width,
+                height,
+                max_stars,
+                1.0,
+                DetectionLevels::Absolute {
+                    above_bg_1: 5.0 * NOISE,
+                    above_bg_2: 2.5 * NOISE,
+                },
+            )
+            .len(),
+            "absolute k·σ must reproduce the noise-relative answer"
         );
 
         // The rank budget is blind to the caller's threshold: a budget

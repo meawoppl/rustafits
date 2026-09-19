@@ -39,6 +39,7 @@ mod snr;
 #[cfg(feature = "debug-pipeline")]
 pub mod render;
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -51,6 +52,20 @@ use crate::processing::stretch::find_median;
 use crate::types::{BayerPattern, ImageMetadata, PixelData};
 
 use detection::DetectionParams;
+
+/// D5 test instrumentation only: counts how many times
+/// [`ImageAnalyzer::run_fast_detection`] built its `lum` slice by borrowing
+/// (`Cow::Borrowed`) versus by copying/extracting (`Cow::Owned`) — on the
+/// CURRENT thread only (`thread_local`, not a shared global), so a test
+/// reading these counts is immune to unrelated tests calling
+/// `run_fast_detection` concurrently on other threads under `cargo test`'s
+/// default parallel runner. Compiled out entirely in non-test builds —
+/// never read or written outside `#[cfg(test)]`.
+#[cfg(test)]
+thread_local! {
+    static LUM_BORROW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LUM_OWNED_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Method used to measure this star's PSF.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -760,7 +775,8 @@ impl ImageAnalyzer {
         // ── Stage 1: Background & Noise ──────────────────────────────────
         let t = std::time::Instant::now();
         let cell_size = background::auto_cell_size(width, height);
-        let mut bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
+        let mut bg_result =
+            background::estimate_background_mesh(&lum, width, height, cell_size, true);
         if self.config.noise_layers > 0 {
             // MRS wavelet noise: accurate but ~500ms. Layers 1-6.
             bg_result.noise = background::estimate_noise_mrs(
@@ -1260,11 +1276,20 @@ impl ImageAnalyzer {
         let pipeline_start = std::time::Instant::now();
 
         let t_prep = std::time::Instant::now();
-        let lum = if channels == 3 {
-            extract_luminance(data, width, height)
+        // D5: a single-channel plane needs no luminance extraction — borrow
+        // the caller's slice instead of copying it into a fresh `Vec`. `lum`
+        // is only ever read (`&lum`/`&*lum`) below, never mutated, so the
+        // borrow lives safely for the rest of this function.
+        let lum: Cow<'_, [f32]> = if channels == 3 {
+            Cow::Owned(extract_luminance(data, width, height))
         } else {
-            data[..width * height].to_vec()
+            Cow::Borrowed(&data[..width * height])
         };
+        #[cfg(test)]
+        match &lum {
+            Cow::Borrowed(_) => LUM_BORROW_COUNT.with(|c| c.set(c.get() + 1)),
+            Cow::Owned(_) => LUM_OWNED_COUNT.with(|c| c.set(c.get() + 1)),
+        }
         let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(
             stage = "prep",
@@ -1956,6 +1981,75 @@ mod tests {
             (dx * dx + dy * dy).sqrt() < 1.5,
             "brightest detection should be near the brightest truth"
         );
+    }
+
+    /// D5: `run_fast_detection` on a single-channel (mono) plane must borrow
+    /// its `lum` slice instead of copying it, and must produce the same
+    /// detections a 3-channel call (which DOES allocate, via
+    /// `extract_luminance`) produces on the equivalent R=G=B image — proving
+    /// the borrow-vs-copy choice is invisible to the result.
+    #[test]
+    fn fast_detection_mono_borrows_and_matches_rgb_owned_path() {
+        let width = 128;
+        let height = 128;
+        let truth: [(f32, f32, f32); 4] = [
+            (30.4, 28.9, 9000.0),
+            (90.2, 40.1, 11000.0),
+            (50.7, 95.3, 7000.0),
+            (100.6, 100.8, 8500.0),
+        ];
+        let sigma = 1.8_f32;
+        let mono = make_synthetic_field(width, height, &truth, sigma, 100.0);
+
+        // R = G = B = mono: `extract_luminance`'s weights
+        // (0.2126 + 0.7152 + 0.0722 == 1.0) reconstruct the mono plane, so
+        // the two paths should agree on every detected star.
+        let mut rgb = Vec::with_capacity(mono.len() * 3);
+        rgb.extend_from_slice(&mono);
+        rgb.extend_from_slice(&mono);
+        rgb.extend_from_slice(&mono);
+
+        let analyzer = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(50)
+            .with_min_star_area(3);
+
+        LUM_BORROW_COUNT.with(|c| c.set(0));
+        LUM_OWNED_COUNT.with(|c| c.set(0));
+
+        let mono_result = analyzer
+            .detect_fast_data(&mono, width, height, 1)
+            .expect("mono fast detection succeeds");
+        assert_eq!(
+            LUM_BORROW_COUNT.with(|c| c.get()),
+            1,
+            "a single-channel call must take the Cow::Borrowed branch"
+        );
+        assert_eq!(
+            LUM_OWNED_COUNT.with(|c| c.get()),
+            0,
+            "a single-channel call must not allocate a copy of lum"
+        );
+
+        let rgb_result = analyzer
+            .detect_fast_data(&rgb, width, height, 3)
+            .expect("rgb fast detection succeeds");
+        assert_eq!(
+            LUM_OWNED_COUNT.with(|c| c.get()),
+            1,
+            "a 3-channel call must still extract (and therefore own) lum"
+        );
+
+        assert_eq!(mono_result.stars.len(), rgb_result.stars.len());
+        for (m, r) in mono_result.stars.iter().zip(rgb_result.stars.iter()) {
+            assert!(
+                (m.x - r.x).abs() < 1e-3 && (m.y - r.y).abs() < 1e-3,
+                "mono-borrowed and rgb-owned detections should coincide: mono=({}, {}) rgb=({}, {})",
+                m.x, m.y, r.x, r.y
+            );
+        }
+        assert!((mono_result.background - rgb_result.background).abs() < 1e-2);
+        assert!((mono_result.noise - rgb_result.noise).abs() < 1e-2);
     }
 
     /// Centroid refinement: with refine ON, recovered centre must be within

@@ -243,7 +243,7 @@ fn run() -> Result<()> {
 fn cmd_background(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
     let t = Instant::now();
     let cell_size = background::auto_cell_size(w, h);
-    let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
+    let mut bg = background::estimate_background_mesh(lum, w, h, cell_size, true);
     let mad_noise = bg.noise;
     if opts.mrs_layers > 0 {
         bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
@@ -295,7 +295,7 @@ fn run_detection(
     f32,  // first-pass measured fwhm
 )> {
     let cell_size = background::auto_cell_size(w, h);
-    let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
+    let mut bg = background::estimate_background_mesh(lum, w, h, cell_size, true);
     if opts.mrs_layers > 0 {
         bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
     }
@@ -513,7 +513,7 @@ fn cmd_fit(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
 
     // Background estimation for local subtraction
     let cell_size = background::auto_cell_size(w, h);
-    let bg = background::estimate_background_mesh(lum, w, h, cell_size);
+    let bg = background::estimate_background_mesh(lum, w, h, cell_size, true);
 
     let x0 = (ix - r as i32) as usize;
     let y0 = (iy - r as i32) as usize;

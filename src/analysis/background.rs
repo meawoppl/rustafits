@@ -24,11 +24,22 @@ pub fn auto_cell_size(width: usize, height: usize) -> usize {
 /// Estimate background and noise using sigma-clipped statistics.
 /// Subsamples to ~500k pixels, runs 3 rounds of 3-sigma clipping.
 /// Estimate background with SExtractor-style mesh grid for spatially varying backgrounds.
+///
+/// `want_noise_map`: the per-pixel noise map is a second bicubic
+/// interpolation pass over the cell grid (the same cost as the background
+/// map's own interpolation) — a caller that only reads `background`,
+/// `noise` (the scalar) and `background_map` should pass `false` to skip
+/// it. The interpolation is a pure leaf (`interpolate_grid_to_map`, no
+/// shared mutable state) that reads `cell_sigma` and writes nothing back,
+/// so skipping it changes no other field: `background_map`, `background`
+/// and `noise` are computed earlier from `filtered_bg`/`cell_sigma`
+/// directly, never from `noise_map` itself.
 pub fn estimate_background_mesh(
     data: &[f32],
     width: usize,
     height: usize,
     cell_size: usize,
+    want_noise_map: bool,
 ) -> BackgroundResult {
     let cell_size = cell_size.max(16);
     let nx = (width + cell_size - 1) / cell_size;
@@ -160,14 +171,28 @@ pub fn estimate_background_mesh(
     let mut valid_bgs: Vec<f32> = (0..nx * ny).map(|i| filtered_bg[i]).collect();
     let background = find_median(&mut valid_bgs);
 
-    // Bicubic interpolation of per-cell noise to full resolution
-    let noise_map = interpolate_grid_to_map(&cell_sigma, nx, ny, width, height, cell_size);
+    // Bicubic interpolation of per-cell noise to full resolution — skipped
+    // when the caller never reads it (see `want_noise_map` doc comment
+    // above); this is a pure leaf call with no effect on `background`,
+    // `noise` or `background_map`, all already finalized above.
+    let noise_map = if want_noise_map {
+        Some(interpolate_grid_to_map(
+            &cell_sigma,
+            nx,
+            ny,
+            width,
+            height,
+            cell_size,
+        ))
+    } else {
+        None
+    };
 
     BackgroundResult {
         background,
         noise: noise.max(0.001),
         background_map: Some(bg_map),
-        noise_map: Some(noise_map),
+        noise_map,
     }
 }
 
@@ -541,7 +566,7 @@ mod tests {
         }
 
         let cell_size = auto_cell_size(width, height);
-        let result = estimate_background_mesh(&data, width, height, cell_size);
+        let result = estimate_background_mesh(&data, width, height, cell_size, true);
         assert!(
             (result.background - bg_level).abs() < 30.0,
             "bg {} should be ~{}",
@@ -563,7 +588,7 @@ mod tests {
             }
         }
 
-        let result = estimate_background_mesh(&data, width, height, 64);
+        let result = estimate_background_mesh(&data, width, height, 64, true);
         assert!(result.background_map.is_some());
         let bg_map = result.background_map.unwrap();
 
@@ -587,6 +612,45 @@ mod tests {
             "right bg {} should be > 1100",
             right_bg
         );
+    }
+
+    /// D4: `want_noise_map = false` must not move `background`, `noise` or
+    /// `background_map` by a single bit — the noise-map interpolation is a
+    /// pure leaf with no side effect on the rest of `BackgroundResult`, and
+    /// this pins that claim rather than just asserting it in a comment.
+    #[test]
+    fn background_map_identical_with_noise_map_flag_either_way() {
+        // Star-field-like image: flat background plus a few bright blobs,
+        // so the >30%-clipped / nearest-neighbor-fill path is exercised too.
+        let width = 200;
+        let height = 200;
+        let bg_level = 800.0_f32;
+        let mut data = vec![bg_level; width * height];
+        let mut rng = 42u64;
+        for val in data.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let noise = ((rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 40.0;
+            *val += noise;
+        }
+        // A few saturated "stars" to force some cells past the contamination
+        // threshold and through the neighbor-fill branch.
+        for &(cx, cy) in &[(30usize, 30usize), (150, 60), (90, 170)] {
+            for dy in 0..6 {
+                for dx in 0..6 {
+                    data[(cy + dy) * width + (cx + dx)] = 50_000.0;
+                }
+            }
+        }
+
+        let cell_size = auto_cell_size(width, height);
+        let with_noise = estimate_background_mesh(&data, width, height, cell_size, true);
+        let without_noise = estimate_background_mesh(&data, width, height, cell_size, false);
+
+        assert_eq!(with_noise.background, without_noise.background);
+        assert_eq!(with_noise.noise, without_noise.noise);
+        assert_eq!(with_noise.background_map, without_noise.background_map);
+        assert!(with_noise.noise_map.is_some());
+        assert!(without_noise.noise_map.is_none());
     }
 
     #[test]

@@ -1292,6 +1292,11 @@ impl ImageAnalyzer {
             self.config.max_stars,
             0.8,
             self.config.detection_levels,
+            // Same (lum, width, height) already computed just above for the
+            // result's own background/noise fields — lum is not mutated in
+            // between, so this is the identical pair the detector would
+            // otherwise recompute.
+            Some((background, noise)),
         );
         let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
         let detected_count = detected.len();

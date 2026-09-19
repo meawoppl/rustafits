@@ -471,6 +471,14 @@ fn scan_region(
 
 /// Adaptive multi-level detection. Returns stars sorted brightest-first
 /// (by flux), trimmed to `max_stars`.
+///
+/// `precomputed_bg_noise`: a caller that already computed
+/// `background_and_noise(lum, width, height)` over this exact buffer (same
+/// values, unmodified in between) may pass that pair here to skip the
+/// second, identical computation. `None` recomputes it internally — the
+/// only correct choice for any caller that cannot prove the pair is over
+/// the same buffer at the same point (a prefiltered detection copy, an
+/// in-place edit, or simply not having computed it already).
 pub fn detect_stars_adaptive(
     lum: &[f32],
     width: usize,
@@ -478,6 +486,7 @@ pub fn detect_stars_adaptive(
     max_stars: usize,
     hfd_min: f32,
     levels: DetectionLevels,
+    precomputed_bg_noise: Option<(f32, f32)>,
 ) -> Vec<(DetectedStar, f32)> {
     if width < 8 || height < 8 {
         return Vec::new();
@@ -486,7 +495,8 @@ pub fn detect_stars_adaptive(
     // Per-scan safety bound: well above any real frame's star count at the
     // ladder levels, only there to bound memory on pathological input.
     let scan_budget = (max_stars * 64).max(8192);
-    let (bg, noise) = background_and_noise(lum, width, height);
+    let (bg, noise) =
+        precomputed_bg_noise.unwrap_or_else(|| background_and_noise(lum, width, height));
     // `scan_region` compares `lum[i] - bg` against its level, so both
     // arms below are ABOVE-background levels: `k·noise` here is the
     // absolute level `bg + k·noise`. No saturation clip is needed on the
@@ -720,6 +730,7 @@ mod tests {
             max_stars,
             1.0,
             DetectionLevels::RankBudget,
+            None,
         );
         assert!(stars.len() >= 16, "expected detections, got {}", stars.len());
         let bright_bottom = stars.iter().filter(|(s, _)| s.y > 470.0).count();
@@ -785,6 +796,7 @@ mod tests {
             max_stars,
             1.0,
             DetectionLevels::NoiseRelative { k1: 5.0, k2: 2.5 },
+            None,
         );
         assert!(
             deep.len() >= 380,
@@ -799,6 +811,7 @@ mod tests {
             max_stars,
             1.0,
             DetectionLevels::NoiseRelative { k1: 20.0, k2: 10.0 },
+            None,
         );
         assert!(
             shallow.len() <= 220,
@@ -825,6 +838,7 @@ mod tests {
                 above_bg_1: 200.0,
                 above_bg_2: 100.0,
             },
+            None,
         );
         assert!(
             bright_only.len() <= 220 && bright_only.len() >= 150,
@@ -841,6 +855,7 @@ mod tests {
                 above_bg_1: 40.0,
                 above_bg_2: 20.0,
             },
+            None,
         );
         assert!(
             both.len() >= 380,
@@ -861,6 +876,7 @@ mod tests {
                     above_bg_1: 5.0 * NOISE,
                     above_bg_2: 2.5 * NOISE,
                 },
+                None,
             )
             .len(),
             "absolute k·σ must reproduce the noise-relative answer"
@@ -872,14 +888,87 @@ mod tests {
         // the DEEP answer no matter what threshold a caller wanted (331 of
         // 400 as measured — the per-tile arm's own local-noise estimate is
         // inflated inside the star-dense tiles, which costs the rest).
-        let budget =
-            detect_stars_adaptive(&data, width, height, max_stars, 1.0, DetectionLevels::RankBudget);
+        let budget = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::RankBudget,
+            None,
+        );
         assert!(
             budget.len() >= 300 && budget.len() > shallow.len(),
             "the budget ladder descends past the faint half regardless of any \
              threshold: {} (shallow {})",
             budget.len(),
             shallow.len()
+        );
+    }
+
+    /// A caller-supplied `(bg, noise)` pair, computed the same way over the
+    /// same buffer, must reproduce exactly what the detector computes for
+    /// itself when passed `None` — the whole point of D3 (skip the caller's
+    /// duplicate `background_and_noise` call) is that this substitution is
+    /// invisible in the output.
+    #[test]
+    fn precomputed_bg_noise_matches_internal_computation() {
+        let (width, height) = (256usize, 256usize);
+        let mut data = vec![500.0_f32; width * height];
+        // A real-shaped field: a grid of stars over flat sky, same fixture
+        // style as the tests above.
+        for gy in 0..8 {
+            for gx in 0..8 {
+                let x = 16.0 + gx as f32 * 30.0;
+                let y = 16.0 + gy as f32 * 30.0;
+                add_star(&mut data, width, x, y, 4000.0, 1.8);
+            }
+        }
+        let mut rng = 42u64;
+        for v in data.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v += ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 10.0;
+        }
+
+        let max_stars = 128;
+        let with_none = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::RankBudget,
+            None,
+        );
+        let bg_noise = background_and_noise(&data, width, height);
+        let with_precomputed = detect_stars_adaptive(
+            &data,
+            width,
+            height,
+            max_stars,
+            1.0,
+            DetectionLevels::RankBudget,
+            Some(bg_noise),
+        );
+
+        assert!(!with_none.is_empty(), "fixture should detect stars");
+
+        // `DetectedStar` derives neither `PartialEq` nor `Debug`; compare
+        // its fields (plus the paired SNR) as plain tuples instead of
+        // widening the struct's derives just for this test.
+        let flatten =
+            |v: &[(DetectedStar, f32)]| -> Vec<(f32, f32, f32, f32, usize, f32, f32, f32)> {
+                v.iter()
+                    .map(|(s, snr)| {
+                        (s.x, s.y, s.peak, s.flux, s.area, s.theta, s.eccentricity, *snr)
+                    })
+                    .collect()
+            };
+        assert_eq!(
+            flatten(&with_none),
+            flatten(&with_precomputed),
+            "a caller-supplied (bg, noise) pair must reproduce the internally \
+             computed one exactly"
         );
     }
 }
@@ -896,7 +985,7 @@ mod diag {
         let (meta, pixels) = crate::formats::read_image(std::path::Path::new(path)).unwrap();
         let (lum, w, h, _, _) = crate::analysis::prepare_luminance(&meta, &pixels, true);
         let stars =
-            detect_stars_adaptive(&lum, w, h, 8000, 0.8, DetectionLevels::RankBudget);
+            detect_stars_adaptive(&lum, w, h, 8000, 0.8, DetectionLevels::RankBudget, None);
         eprintln!("total {}", stars.len());
         eprintln!("top 25 by flux (x y flux area~hfd2 snr):");
         for (s, snr) in stars.iter().take(25) {

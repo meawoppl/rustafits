@@ -40,8 +40,49 @@ pub(crate) fn background_and_noise(
     width: usize,
     height: usize,
 ) -> (f32, f32) {
-    // Integer histogram, bins 1..=64999 (ignore 0 and ≥65000).
-    let mut hist = vec![0u32; 65000];
+    // Integer histogram, bins 1..=64999 (ignore 0 and ≥65000). Built as
+    // per-row partial `u32` histograms (`par_chunks`) merged by an
+    // element-wise integer add: `u32` addition is associative and
+    // commutative, so the merged counts are bit-for-bit identical to the
+    // old single-threaded build no matter how rayon splits the rows — no
+    // per-row alignment is even required for that guarantee, it is just a
+    // natural chunk granularity for an image.
+    //
+    // `sum`/`n` stay their OWN sequential, single-pass loop below — `sum`
+    // is an `f64` running total, and float addition is NOT associative, so
+    // parallel partial sums (however they are combined back together)
+    // are not guaranteed to reproduce the exact sequential total `mean`
+    // below is computed from. Splitting the sequential pass out of the
+    // (now parallel) histogram build costs one extra linear scan of
+    // `lum`, which is cheap next to the histogram build it replaces
+    // (sequential, cache-hostile random writes into a 65000-entry array).
+    use rayon::prelude::*;
+    let hist: Vec<u32> = lum
+        .par_chunks(width.max(1))
+        .fold(
+            || vec![0u32; 65000],
+            |mut acc, row| {
+                for &v in row {
+                    if v <= 0.0 || v >= 65000.0 {
+                        continue;
+                    }
+                    let b = v.round() as usize;
+                    if b >= 1 && b < 65000 {
+                        acc[b] += 1;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0u32; 65000],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            },
+        );
     let mut sum = 0.0f64;
     let mut n = 0u64;
     for &v in lum {
@@ -50,7 +91,6 @@ pub(crate) fn background_and_noise(
         }
         let b = v.round() as usize;
         if b >= 1 && b < 65000 {
-            hist[b] += 1;
             sum += v as f64;
             n += 1;
         }
@@ -146,16 +186,37 @@ pub enum DetectionLevels {
 /// flat-topped cores still register.
 fn star_levels(
     lum: &[f32],
+    width: usize,
     backgr: f32,
     sd: f32,
     max_stars: usize,
 ) -> (f32, f32) {
-    let mut hist = vec![0u32; 65536];
-    for &v in lum {
-        if v > 0.0 && v < 65535.0 {
-            hist[v.round() as usize] += 1;
-        }
-    }
+    // Same per-row partial-histogram + integer-reduce shape as
+    // `background_and_noise` — this function has no `sum`/`n` accumulator
+    // at all, so unlike that one there is nothing to keep sequential.
+    use rayon::prelude::*;
+    let hist: Vec<u32> = lum
+        .par_chunks(width.max(1))
+        .fold(
+            || vec![0u32; 65536],
+            |mut acc, row| {
+                for &v in row {
+                    if v > 0.0 && v < 65535.0 {
+                        acc[v.round() as usize] += 1;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0u32; 65536],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            },
+        );
     let factor = (6 * max_stars) as u64;
     let factor2 = (24 * max_stars) as u64;
     let mut cum = 0u64;
@@ -219,12 +280,129 @@ fn local_bg_noise(samples: &[f32]) -> (f32, f32) {
     (mean, sd.max(1e-6))
 }
 
+/// Selection median: the value `select_nth_unstable_by` places at index
+/// `len/2` is, by definition, the same value a full sort would place there
+/// (duplicates make the position ambiguous, never the VALUE at it) — same
+/// odd/even rule as before (no averaging either way: this always reads a
+/// single element at `len/2`, truncating division). `total_cmp` is a
+/// genuine total order (unlike `partial_cmp`), so it never panics; a
+/// standalone 500k-trial fuzz harness (same rustc, all-finite `f32` inputs
+/// incl. duplicate/tied values, reported alongside this task) found it
+/// returns the exact same value as the old
+/// `sort_by(|a,b| a.partial_cmp(b).unwrap_or(Equal))[len/2]` in every
+/// trial. A NaN-containing input is NOT the same story:
+/// `partial_cmp().unwrap_or(Equal)` is not a total order, and on this
+/// toolchain `sort_by` with it PANICS on a large fraction of
+/// NaN-containing inputs (the same harness measured ~73% of 200k
+/// single-NaN trials) — a pre-existing, Task-4-unrelated defect in the old
+/// code, not a behaviour this function preserves.
+/// `select_nth_unstable_by(total_cmp)` never panics on any input. See the
+/// report for the measurement and why `hfd_at`'s own fixture keeps its one
+/// in-image NaN pixel out of `median()`'s input (`ann`/`devs`) rather than
+/// attempting to pin the old code's crash.
 fn median(v: &mut [f32]) -> f32 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    v[v.len() / 2]
+    let mid = v.len() / 2;
+    let (_, elem, _) = v.select_nth_unstable_by(mid, f32::total_cmp);
+    *elem
+}
+
+/// Half-width of the window `hfd_at` ever reads: the annulus band's outer
+/// radius (`RS_INITIAL + ANNULUS_W`). `rs` may only shrink from
+/// `RS_INITIAL` after this point (the centroid loop's shrink-to-symmetry
+/// retry) and `r_ap` only grows up to the (possibly shrunk) `rs` — so this
+/// bound covers every pixel every loop in `hfd_at` ever touches, and the
+/// window can be copied out of `lum` exactly once.
+const RS_INITIAL: i32 = 14;
+const ANNULUS_W: i32 = 3;
+const HFD_HALF: i32 = RS_INITIAL + ANNULUS_W;
+const HFD_SCRATCH_DIM: usize = (2 * HFD_HALF + 1) as usize;
+
+/// `(dx*dx + dy*dy) as f32` for every offset in the `hfd_at` scratch window,
+/// precomputed at compile time. Both radius tests in `hfd_at` computed
+/// `((dx * dx + dy * dy) as f32).sqrt()` — `i32` multiply/add, THEN cast to
+/// `f32`, THEN `sqrt` — and compared the sqrt against a non-squared radius
+/// (`rs`/`rs+annulus_w`, or `r_ap`/`r_ap+1`); this table caches exactly the
+/// `(i32 sum) as f32` step (itself exact: the largest value here, `578`,
+/// is far inside `f32`'s 24-bit exact-integer range) and `.sqrt()` is still
+/// called on the looked-up value at each use site, so no comparison changes
+/// from a squared-vs-squared form — the boundary rounding the brief warns
+/// about never enters the picture.
+const fn build_hfd_r2_table() -> [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM] {
+    let mut t = [[0.0f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
+    let mut iy = 0usize;
+    while iy < HFD_SCRATCH_DIM {
+        let dy = iy as i32 - HFD_HALF;
+        let mut ix = 0usize;
+        while ix < HFD_SCRATCH_DIM {
+            let dx = ix as i32 - HFD_HALF;
+            t[iy][ix] = (dx * dx + dy * dy) as f32;
+            ix += 1;
+        }
+        iy += 1;
+    }
+    t
+}
+const HFD_R2: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM] = build_hfd_r2_table();
+
+#[inline]
+fn hfd_r2(dx: i32, dy: i32) -> f32 {
+    HFD_R2[(dy + HFD_HALF) as usize][(dx + HFD_HALF) as usize]
+}
+
+/// One `hfd_at` call's window, copied out of `lum` exactly once. `val`
+/// holds the raw pixel value (border-filled with `f32::NAN`) and
+/// `in_bounds` is the SAME per-offset bound check the old code ran inline
+/// in every one of its five loops, kept as its own flag rather than
+/// inferred from `val`'s NaN-ness: a real in-image NaN pixel is a legal
+/// in-bounds value the old bound checks always let through (only the
+/// arithmetic that consumed it decided what happened next), and it must
+/// keep being let through here — `in_bounds` is what every loop below
+/// gates on, `val` is read unconditionally once it is.
+struct HfdScratch {
+    val: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
+    in_bounds: [[bool; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
+}
+
+impl HfdScratch {
+    fn build(lum: &[f32], width: usize, height: usize, sx: usize, sy: usize) -> Self {
+        let mut val = [[f32::NAN; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
+        let mut in_bounds = [[false; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
+        for dy in -HFD_HALF..=HFD_HALF {
+            let y = sy as i32 + dy;
+            if y < 0 || y as usize >= height {
+                continue;
+            }
+            let iy = (dy + HFD_HALF) as usize;
+            let row_base = y as usize * width;
+            for dx in -HFD_HALF..=HFD_HALF {
+                let x = sx as i32 + dx;
+                if x < 0 || x as usize >= width {
+                    continue;
+                }
+                let ix = (dx + HFD_HALF) as usize;
+                in_bounds[iy][ix] = true;
+                val[iy][ix] = lum[row_base + x as usize];
+            }
+        }
+        HfdScratch { val, in_bounds }
+    }
+
+    /// `Some(raw pixel value)` when `(sx+dx, sy+dy)` was in bounds — exactly
+    /// the condition every old per-loop bound check gated on — `None`
+    /// otherwise, for the caller to `continue` on precisely as before.
+    #[inline]
+    fn get(&self, dx: i32, dy: i32) -> Option<f32> {
+        let iy = (dy + HFD_HALF) as usize;
+        let ix = (dx + HFD_HALF) as usize;
+        if self.in_bounds[iy][ix] {
+            Some(self.val[iy][ix])
+        } else {
+            None
+        }
+    }
 }
 
 /// Half-flux-diameter + flux-weighted centroid at a seed pixel. Uses a
@@ -240,19 +418,17 @@ fn hfd_at(
     sx: usize,
     sy: usize,
 ) -> Option<(f32, f32, f32, f32, f32, f32)> {
-    let mut rs: i32 = 14;
-    let annulus_w: i32 = 3;
+    let scratch = HfdScratch::build(lum, width, height, sx, sy);
+    let mut rs: i32 = RS_INITIAL;
 
     // Local background = median of the rs..rs+annulus_w annulus; σ via MAD.
     let mut ann: Vec<f32> = Vec::new();
-    for dy in -(rs + annulus_w)..=(rs + annulus_w) {
-        for dx in -(rs + annulus_w)..=(rs + annulus_w) {
-            let rr = ((dx * dx + dy * dy) as f32).sqrt();
-            if rr > rs as f32 && rr <= (rs + annulus_w) as f32 {
-                let x = sx as i32 + dx;
-                let y = sy as i32 + dy;
-                if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
-                    ann.push(lum[y as usize * width + x as usize]);
+    for dy in -HFD_HALF..=HFD_HALF {
+        for dx in -HFD_HALF..=HFD_HALF {
+            let rr = hfd_r2(dx, dy).sqrt();
+            if rr > RS_INITIAL as f32 && rr <= (RS_INITIAL + ANNULUS_W) as f32 {
+                if let Some(v) = scratch.get(dx, dy) {
+                    ann.push(v);
                 }
             }
         }
@@ -274,13 +450,13 @@ fn hfd_at(
         let mut signal = 0u32;
         for dy in -rs..=rs {
             for dx in -rs..=rs {
-                let x = sx as i32 + dx;
-                let y = sy as i32 + dy;
-                if x < 0 || y < 0 || x as usize >= width || y as usize >= height {
+                let Some(raw) = scratch.get(dx, dy) else {
                     continue;
-                }
-                let val = lum[y as usize * width + x as usize] - star_bg;
+                };
+                let val = raw - star_bg;
                 if val > 3.0 * sd_bg {
+                    let x = sx as i32 + dx;
+                    let y = sy as i32 + dy;
                     sum_val += val as f64;
                     sum_x += val as f64 * x as f64;
                     sum_y += val as f64 * y as f64;
@@ -305,12 +481,10 @@ fn hfd_at(
     let mut peak = 0.0f32;
     for dy in -rs..=rs {
         for dx in -rs..=rs {
-            let x = sx as i32 + dx;
-            let y = sy as i32 + dy;
-            if x < 0 || y < 0 || x as usize >= width || y as usize >= height {
+            let Some(raw) = scratch.get(dx, dy) else {
                 continue;
-            }
-            let val = lum[y as usize * width + x as usize] - star_bg;
+            };
+            let val = raw - star_bg;
             if val > peak {
                 peak = val;
             }
@@ -326,16 +500,10 @@ fn hfd_at(
         let mut c = 0u32;
         for dy in -(r_ap + 1)..=(r_ap + 1) {
             for dx in -(r_ap + 1)..=(r_ap + 1) {
-                let rr = ((dx * dx + dy * dy) as f32).sqrt();
+                let rr = hfd_r2(dx, dy).sqrt();
                 if rr > r_ap as f32 && rr <= (r_ap + 1) as f32 {
-                    let x = sx as i32 + dx;
-                    let y = sy as i32 + dy;
-                    if x >= 0
-                        && y >= 0
-                        && (x as usize) < width
-                        && (y as usize) < height
-                    {
-                        s += lum[y as usize * width + x as usize] - star_bg;
+                    if let Some(raw) = scratch.get(dx, dy) {
+                        s += raw - star_bg;
                         c += 1;
                     }
                 }
@@ -354,12 +522,12 @@ fn hfd_at(
     let mut flux = 0.0f64;
     for dy in -r_ap..=r_ap {
         for dx in -r_ap..=r_ap {
+            let Some(raw) = scratch.get(dx, dy) else {
+                continue;
+            };
             let x = sx as i32 + dx;
             let y = sy as i32 + dy;
-            if x < 0 || y < 0 || x as usize >= width || y as usize >= height {
-                continue;
-            }
-            let val = (lum[y as usize * width + x as usize] - star_bg).max(0.0);
+            let val = (raw - star_bg).max(0.0);
             let r = (((x as f32 - cx).powi(2)) + ((y as f32 - cy).powi(2))).sqrt();
             sum_v += val as f64;
             sum_vr += val as f64 * r as f64;
@@ -503,7 +671,7 @@ pub fn detect_stars_adaptive(
     // noise-relative arm — a few-σ level can never land above the
     // saturation ceiling the way a rank-derived one can.
     let (star_level, star_level2) = match levels {
-        DetectionLevels::RankBudget => star_levels(lum, bg, noise, max_stars),
+        DetectionLevels::RankBudget => star_levels(lum, width, bg, noise, max_stars),
         DetectionLevels::NoiseRelative { k1, k2 } => (k1 * noise, k2 * noise),
         DetectionLevels::Absolute {
             above_bg_1,
@@ -659,6 +827,102 @@ const STAMP_RADIUS_MAX: i32 = 24;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixture shared by the D7/D11 bit-identity pins below: a deterministic
+    /// synthetic frame with five `hfd_at` candidates —
+    /// a star near the image border/corner (offset 12,12: the `hfd_at`
+    /// window reaches `HFD_HALF = 17` px in every direction, so this seed's
+    /// window spans well past both edges), two stars of different radii
+    /// (sigma 1.6 vs 3.2, at 80,60 and 160,60), a saturated star (240,60,
+    /// clipped to 60000 ADU), and a star with a genuine in-image NaN pixel
+    /// 5,5 px from its center (80,160 → NaN at 85,165) — inside the rs=14
+    /// centroid/peak/aperture disk (dist ≈7.07) but OUTSIDE the (14,17]
+    /// background annulus `median()` reads, so the fixture does not trip
+    /// the pre-existing (Task-4-unrelated) panic in `f32::sort_by` with a
+    /// `partial_cmp().unwrap_or(Equal)` comparator over NaN-containing
+    /// input (see the report: `select_nth_unstable_by(total_cmp)` does not
+    /// have this failure mode, `sort_by` does, on this toolchain).
+    fn hfd_pin_fixture() -> (Vec<f32>, usize, usize) {
+        let width = 300usize;
+        let height = 220usize;
+        let mut data = vec![300.0_f32; width * height];
+
+        add_star(&mut data, width, 12.0, 12.0, 6000.0, 1.6);
+        add_star(&mut data, width, 80.0, 60.0, 5000.0, 1.6);
+        add_star(&mut data, width, 160.0, 60.0, 5000.0, 3.2);
+        add_star(&mut data, width, 240.0, 60.0, 200000.0, 2.0);
+        add_star(&mut data, width, 80.0, 160.0, 5000.0, 1.6);
+        data[165 * width + 85] = f32::NAN;
+
+        let mut rng = 24601u64;
+        for v in data.iter_mut() {
+            if v.is_nan() {
+                continue;
+            }
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v += ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0;
+        }
+        for v in data.iter_mut() {
+            if !v.is_nan() && *v > 60000.0 {
+                *v = 60000.0;
+            }
+        }
+        (data, width, height)
+    }
+
+    /// D7 RED/GREEN oracle: the exact `hfd_at` outputs recorded from the
+    /// pre-Task-4 code (per-loop bound checks straight into `lum`, a full
+    /// `sort_by` median) on [`hfd_pin_fixture`]. The scratch-window +
+    /// `R2`-table + `select_nth_unstable_by` rewrite must reproduce every
+    /// bit.
+    #[test]
+    fn hfd_at_matches_pre_task4_recording() {
+        let (data, width, height) = hfd_pin_fixture();
+        let seeds: [(usize, usize); 5] = [(12, 12), (80, 60), (160, 60), (240, 60), (80, 160)];
+        let expected: [Option<(f32, f32, f32, f32, f32, f32)>; 5] = [
+            Some((
+                12.000035, 11.999964, 3.7141128, 91521.09, 6000.586, 302.36023,
+            )),
+            Some((80.00001, 60.0012, 3.714019, 76257.55, 4998.896, 275.84518)),
+            Some((
+                159.99959, 60.000435, 7.6192484, 309840.22, 4999.7036, 555.84424,
+            )),
+            Some((
+                240.00005, 60.000004, 5.872633, 3278450.8, 59700.074, 1810.5519,
+            )),
+            Some((
+                80.000046, 159.99963, 3.7132785, 76249.07, 4996.823, 275.84732,
+            )),
+        ];
+        for (i, (sx, sy)) in seeds.into_iter().enumerate() {
+            let got = hfd_at(&data, width, height, sx, sy);
+            assert_eq!(
+                got, expected[i],
+                "hfd_at({sx}, {sy}) diverged from the pre-Task-4 recording"
+            );
+        }
+    }
+
+    /// D11 RED/GREEN oracle: `background_and_noise` and `star_levels`
+    /// recorded from the pre-Task-4 (sequential-histogram) code on
+    /// [`hfd_pin_fixture`]. The counts must stay integer-exact under the
+    /// parallel per-row histogram + reduce.
+    #[test]
+    fn histograms_match_pre_task4_recording() {
+        let (data, width, height) = hfd_pin_fixture();
+        let bgn = background_and_noise(&data, width, height);
+        assert_eq!(
+            bgn,
+            (299.0, 2.0045419),
+            "background_and_noise diverged from the pre-Task-4 recording"
+        );
+        let sl = star_levels(&data, width, bgn.0, bgn.1, 24);
+        assert_eq!(
+            sl,
+            (3385.0, 148.0),
+            "star_levels diverged from the pre-Task-4 recording"
+        );
+    }
 
     fn add_star(data: &mut [f32], width: usize, x: f32, y: f32, amp: f32, sigma: f32) {
         let height = data.len() / width;

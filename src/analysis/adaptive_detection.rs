@@ -352,22 +352,47 @@ fn hfd_r2(dx: i32, dy: i32) -> f32 {
     HFD_R2[(dy + HFD_HALF) as usize][(dx + HFD_HALF) as usize]
 }
 
-/// One `hfd_at` call's window, copied out of `lum` exactly once. `val`
-/// holds the raw pixel value (border-filled with `f32::NAN`) and
-/// `in_bounds` is the SAME per-offset bound check the old code ran inline
-/// in every one of its five loops, kept as its own flag rather than
-/// inferred from `val`'s NaN-ness: a real in-image NaN pixel is a legal
-/// in-bounds value the old bound checks always let through (only the
-/// arithmetic that consumed it decided what happened next), and it must
-/// keep being let through here — `in_bounds` is what every loop below
-/// gates on, `val` is read unconditionally once it is.
-struct HfdScratch {
-    val: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
-    in_bounds: [[bool; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
+/// One `hfd_at` call's window, copied out of `lum` exactly once.
+enum HfdScratch {
+    /// The whole 35×35 window is inside the image — every offset is a
+    /// real pixel, unconditionally. Built with ONE contiguous-slice copy
+    /// per row (35 memcpys of 35 floats — `lum`'s row-major layout makes a
+    /// window row exactly `HFD_SCRATCH_DIM` contiguous floats) rather than
+    /// 1225 individually bounds-checked scalar reads. This is the path
+    /// almost every candidate takes (the border ring is `HFD_HALF` = 17 px
+    /// wide), and it is the one the first cut of this scratch got wrong:
+    /// pre-filling a `[[f32::NAN; 35]; 35]` (and an all-`false` bounds
+    /// array) before overwriting nearly all of it turned out to be pure
+    /// waste the compiler did not elide, measured as a net SLOWDOWN on
+    /// `register_probe` (see the report) — this variant does no fill at
+    /// all, only real writes.
+    Interior([[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM]),
+    /// The window reaches past an edge. `val` is the raw pixel value
+    /// (`f32::NAN` sentinel for an out-of-bounds cell) and `in_bounds` is
+    /// the SAME per-offset bound check the old code ran inline in every
+    /// one of its five loops, kept as its own flag rather than inferred
+    /// from `val`'s NaN-ness: a real in-image NaN pixel is a legal
+    /// in-bounds value the old bound checks always let through, and it
+    /// must keep being let through here.
+    Border {
+        val: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
+        in_bounds: [[bool; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM],
+    },
 }
 
 impl HfdScratch {
     fn build(lum: &[f32], width: usize, height: usize, sx: usize, sy: usize) -> Self {
+        let half = HFD_HALF as usize;
+        if sx >= half && sy >= half && sx + half < width && sy + half < height {
+            let x0 = sx - half;
+            let y0 = sy - half;
+            let mut val = [[0.0f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
+            for (iy, row) in val.iter_mut().enumerate() {
+                let src = (y0 + iy) * width + x0;
+                row.copy_from_slice(&lum[src..src + HFD_SCRATCH_DIM]);
+            }
+            return HfdScratch::Interior(val);
+        }
         let mut val = [[f32::NAN; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
         let mut in_bounds = [[false; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM];
         for dy in -HFD_HALF..=HFD_HALF {
@@ -387,20 +412,27 @@ impl HfdScratch {
                 val[iy][ix] = lum[row_base + x as usize];
             }
         }
-        HfdScratch { val, in_bounds }
+        HfdScratch::Border { val, in_bounds }
     }
 
     /// `Some(raw pixel value)` when `(sx+dx, sy+dy)` was in bounds — exactly
     /// the condition every old per-loop bound check gated on — `None`
     /// otherwise, for the caller to `continue` on precisely as before.
+    /// `Interior` never needs the bounds lookup at all: by construction
+    /// every offset there is a real, in-bounds pixel.
     #[inline]
     fn get(&self, dx: i32, dy: i32) -> Option<f32> {
         let iy = (dy + HFD_HALF) as usize;
         let ix = (dx + HFD_HALF) as usize;
-        if self.in_bounds[iy][ix] {
-            Some(self.val[iy][ix])
-        } else {
-            None
+        match self {
+            HfdScratch::Interior(val) => Some(val[iy][ix]),
+            HfdScratch::Border { val, in_bounds } => {
+                if in_bounds[iy][ix] {
+                    Some(val[iy][ix])
+                } else {
+                    None
+                }
+            }
         }
     }
 }

@@ -196,37 +196,6 @@ pub fn estimate_background_mesh(
     }
 }
 
-/// A fixed-size bit-packed boolean mask (`Vec<u64>`, one bit per element).
-///
-/// Tier A task-3b, item 3: `estimate_noise_mrs`'s significance mask is one
-/// bool per pixel (a full plane, ~26 MB at 6.5k×4.2k with `Vec<bool>`'s
-/// one-byte-per-element layout) and is read/written in exactly two shapes
-/// throughout that function — `!mask[idx]` and `mask[idx] = true` — so a
-/// bit-packed representation (~3.3 MB, same pixel count) changes nothing
-/// any caller observes: no value read from the mask depends on how it is
-/// stored, only on which bits are set.
-struct BitMask {
-    words: Vec<u64>,
-}
-
-impl BitMask {
-    fn new(len: usize) -> Self {
-        Self {
-            words: vec![0u64; len.div_ceil(64)],
-        }
-    }
-
-    #[inline]
-    fn get(&self, idx: usize) -> bool {
-        (self.words[idx >> 6] >> (idx & 63)) & 1 != 0
-    }
-
-    #[inline]
-    fn set(&mut self, idx: usize) {
-        self.words[idx >> 6] |= 1u64 << (idx & 63);
-    }
-}
-
 /// Noise estimation via iterative Multiresolution Support (MRS).
 ///
 /// Algorithm (matches the reference implementation's approach):
@@ -271,14 +240,14 @@ pub fn estimate_noise_mrs(
 
     // ── Build significance mask across all wavelet layers ──
     // true = significant (contains structure), excluded from noise estimate
-    let mut sig_mask = BitMask::new(total);
+    let mut sig_mask = vec![false; total];
 
     // Layer 1: mark significant pixels in w1
     let sigma1 = simple_mad_noise(&w1, width, height);
     let thresh1 = 3.0 * sigma1;
     for i in 0..total {
         if w1[i].abs() > thresh1 {
-            sig_mask.set(i);
+            sig_mask[i] = true;
         }
     }
 
@@ -317,7 +286,7 @@ pub fn estimate_noise_mrs(
             let mut x = border;
             while x < width.saturating_sub(border) {
                 let idx = y * width + x;
-                if !sig_mask.get(idx) {
+                if !sig_mask[idx] {
                     let coeff = prev_smooth[idx] - next_smooth[idx];
                     if coeff.is_finite() {
                         wj_samples.push(coeff);
@@ -337,10 +306,10 @@ pub fn estimate_noise_mrs(
 
             // Mark significant pixels at this scale
             for idx in 0..total {
-                if !sig_mask.get(idx) {
+                if !sig_mask[idx] {
                     let coeff = prev_smooth[idx] - next_smooth[idx];
                     if coeff.abs() > thresh_j {
-                        sig_mask.set(idx);
+                        sig_mask[idx] = true;
                     }
                 }
             }
@@ -365,7 +334,7 @@ pub fn estimate_noise_mrs(
             let mut x = border;
             while x < width.saturating_sub(border) {
                 let idx = y * width + x;
-                if !sig_mask.get(idx) && w1[idx].abs() <= thresh {
+                if !sig_mask[idx] && w1[idx].abs() <= thresh {
                     samples.push(w1[idx]);
                 }
                 x += stride;
@@ -788,8 +757,7 @@ mod tests {
                     }
                     let fx = dx as f32 / r;
                     let fy = dy as f32 / r;
-                    data[y as usize * w + x as usize] +=
-                        amp * (-0.5 * (fx * fx + fy * fy)).exp();
+                    data[y as usize * w + x as usize] += amp * (-0.5 * (fx * fx + fy * fy)).exp();
                 }
             }
         }

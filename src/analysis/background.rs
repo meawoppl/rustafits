@@ -196,9 +196,40 @@ pub fn estimate_background_mesh(
     }
 }
 
+/// A fixed-size bit-packed boolean mask (`Vec<u64>`, one bit per element).
+///
+/// Tier A task-3b, item 3: `estimate_noise_mrs`'s significance mask is one
+/// bool per pixel (a full plane, ~26 MB at 6.5k×4.2k with `Vec<bool>`'s
+/// one-byte-per-element layout) and is read/written in exactly two shapes
+/// throughout that function — `!mask[idx]` and `mask[idx] = true` — so a
+/// bit-packed representation (~3.3 MB, same pixel count) changes nothing
+/// any caller observes: no value read from the mask depends on how it is
+/// stored, only on which bits are set.
+struct BitMask {
+    words: Vec<u64>,
+}
+
+impl BitMask {
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> bool {
+        (self.words[idx >> 6] >> (idx & 63)) & 1 != 0
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize) {
+        self.words[idx >> 6] |= 1u64 << (idx & 63);
+    }
+}
+
 /// Noise estimation via iterative Multiresolution Support (MRS).
 ///
-/// Algorithm (matches PixInsight's approach):
+/// Algorithm (matches the reference implementation's approach):
 /// 1. Compute à trous wavelet coefficients at layers 1..noise_layers
 /// 2. At each layer, identify "significant" pixels (|w_j| > 3σ_j)
 /// 3. Build a cumulative significance mask across all layers
@@ -208,7 +239,7 @@ pub fn estimate_background_mesh(
 /// `noise_layers`: number of wavelet scales for significance detection (1-6).
 /// Layer 1 = finest scale (pixel noise), higher layers = coarser structures.
 /// More layers → better structure rejection → purer noise estimate.
-/// Default: 4 (matches PixInsight). Minimum: 1.
+/// Default: 4 (the usual default). Minimum: 1.
 pub fn estimate_noise_mrs(
     data: &[f32],
     width: usize,
@@ -240,23 +271,38 @@ pub fn estimate_noise_mrs(
 
     // ── Build significance mask across all wavelet layers ──
     // true = significant (contains structure), excluded from noise estimate
-    let mut sig_mask = vec![false; total];
+    let mut sig_mask = BitMask::new(total);
 
     // Layer 1: mark significant pixels in w1
     let sigma1 = simple_mad_noise(&w1, width, height);
     let thresh1 = 3.0 * sigma1;
     for i in 0..total {
         if w1[i].abs() > thresh1 {
-            sig_mask[i] = true;
+            sig_mask.set(i);
         }
     }
 
     // Layers 2..N: compute dilated wavelet coefficients, mark significant pixels
-    // Each layer operates on the smoothed output of the previous layer
+    // Each layer operates on the smoothed output of the previous layer.
+    //
+    // Tier A task-3b, item 1: `next_smooth` used to be a fresh `vec![0.0;
+    // total]` allocated inside the loop on every layer (up to 5 more
+    // full-plane allocations at `noise_layers = 6`), each one immediately
+    // superseding the previous `prev_smooth` once `prev_smooth =
+    // next_smooth` ran. Two named buffers now ping-pong via `mem::swap`
+    // instead: `prev_smooth` starts as the layer-1 `smoothed` plane (moved
+    // in, no copy), `next_smooth` is the ONE extra buffer this loop ever
+    // allocates, and every iteration writes into whichever buffer currently
+    // holds the STALE (already-consumed) values before swapping the names.
+    // `b3_spline_smooth_dilated` writes every element of its `output`
+    // parameter (`par_chunks_mut(width)` covers every row, every `row[x] =
+    // sum`) — the same total-overwrite guarantee `vec![0.0; total]` gave,
+    // so reusing a buffer that still holds a prior layer's numbers is safe:
+    // nothing is ever read from it before this call fills it.
     let mut prev_smooth = smoothed;
+    let mut next_smooth = vec![0.0_f32; total];
 
     for layer in 2..=noise_layers {
-        let mut next_smooth = vec![0.0_f32; total];
         b3_spline_smooth_dilated(&prev_smooth, width, height, &mut next_smooth, layer);
 
         // Wavelet coefficients at this layer: w_j = c_{j-1} - c_j
@@ -271,7 +317,7 @@ pub fn estimate_noise_mrs(
             let mut x = border;
             while x < width.saturating_sub(border) {
                 let idx = y * width + x;
-                if !sig_mask[idx] {
+                if !sig_mask.get(idx) {
                     let coeff = prev_smooth[idx] - next_smooth[idx];
                     if coeff.is_finite() {
                         wj_samples.push(coeff);
@@ -291,16 +337,16 @@ pub fn estimate_noise_mrs(
 
             // Mark significant pixels at this scale
             for idx in 0..total {
-                if !sig_mask[idx] {
+                if !sig_mask.get(idx) {
                     let coeff = prev_smooth[idx] - next_smooth[idx];
                     if coeff.abs() > thresh_j {
-                        sig_mask[idx] = true;
+                        sig_mask.set(idx);
                     }
                 }
             }
         }
 
-        prev_smooth = next_smooth;
+        std::mem::swap(&mut prev_smooth, &mut next_smooth);
     }
 
     // ── Re-estimate noise from layer-1 coefficients, excluding masked pixels ──
@@ -319,7 +365,7 @@ pub fn estimate_noise_mrs(
             let mut x = border;
             while x < width.saturating_sub(border) {
                 let idx = y * width + x;
-                if !sig_mask[idx] && w1[idx].abs() <= thresh {
+                if !sig_mask.get(idx) && w1[idx].abs() <= thresh {
                     samples.push(w1[idx]);
                 }
                 x += stride;
@@ -698,5 +744,83 @@ mod tests {
             "4-layer noise {:.2} should be within 50% of true sigma {:.2}",
             noise_4layer, true_sigma,
         );
+    }
+
+    /// Deterministic synthetic plane for the Tier A task-3b bit-identity
+    /// pins below: a gradient background, xorshift pseudo-noise, several
+    /// Gaussian "stars", and one saturated blob — the mix `estimate_noise_mrs`
+    /// exists to be robust against (structure the significance mask must
+    /// suppress, plus a non-finite-free saturated region to exercise the
+    /// border/clamped index paths).
+    fn synthetic_noise_fixture(w: usize, h: usize) -> Vec<f32> {
+        let mut data = vec![0.0_f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = 500.0 + 800.0 * (x as f32 / (w - 1) as f32);
+            }
+        }
+        // Deterministic xorshift64 pseudo-noise.
+        let mut rng: u64 = 88172645463325252;
+        for v in data.iter_mut() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let u = (rng >> 40) as f32 / (1u64 << 24) as f32;
+            *v += (u - 0.5) * 40.0;
+        }
+        // A handful of Gaussian "stars" at fixed positions/amplitudes.
+        let stars: [(usize, usize, f32, f32); 6] = [
+            (60, 60, 2.5, 3000.0),
+            (200, 150, 2.0, 5000.0),
+            (350, 100, 1.5, 2000.0),
+            (100, 300, 3.0, 8000.0),
+            (400, 400, 1.0, 1500.0),
+            (250, 420, 1.8, 4000.0),
+        ];
+        for &(cx, cy, r, amp) in &stars {
+            let radius = (r * 6.0).ceil() as i64;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let x = cx as i64 + dx;
+                    let y = cy as i64 + dy;
+                    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                        continue;
+                    }
+                    let fx = dx as f32 / r;
+                    let fy = dy as f32 / r;
+                    data[y as usize * w + x as usize] +=
+                        amp * (-0.5 * (fx * fx + fy * fy)).exp();
+                }
+            }
+        }
+        // One saturated blob.
+        for y in 240..260.min(h) {
+            for x in 240..260.min(w) {
+                data[y * w + x] = 65000.0;
+            }
+        }
+        data
+    }
+
+    /// Task 3b pin (controller ruling R-TA-2): `estimate_noise_mrs` returns
+    /// the SAME `f32`, bit-exact, for every `noise_layers` this crate's
+    /// caller exercises (1 — the `simple_mad_noise` early return; 2 — the
+    /// shortest layer loop; 4 — production's `MRS_LAYERS`; 6 — the clamp
+    /// ceiling), before and after the ping-pong/bit-packed-mask rewrite.
+    /// Values recorded from the CURRENT (pre-task-3b) code.
+    #[test]
+    fn estimate_noise_mrs_bit_exact_pins() {
+        let (w, h) = (512, 512);
+        let data = synthetic_noise_fixture(w, h);
+
+        let n1 = estimate_noise_mrs(&data, w, h, 1);
+        let n2 = estimate_noise_mrs(&data, w, h, 2);
+        let n4 = estimate_noise_mrs(&data, w, h, 4);
+        let n6 = estimate_noise_mrs(&data, w, h, 6);
+
+        assert_eq!(n1, 12.759915_f32, "noise_layers=1");
+        assert_eq!(n2, 12.710779_f32, "noise_layers=2");
+        assert_eq!(n4, 12.720099_f32, "noise_layers=4");
+        assert_eq!(n6, 12.748694_f32, "noise_layers=6");
     }
 }

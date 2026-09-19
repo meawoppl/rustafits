@@ -321,7 +321,10 @@ const HFD_HALF: i32 = RS_INITIAL + ANNULUS_W;
 const HFD_SCRATCH_DIM: usize = (2 * HFD_HALF + 1) as usize;
 
 /// `(dx*dx + dy*dy) as f32` for every offset in the `hfd_at` scratch window,
-/// precomputed at compile time. Both radius tests in `hfd_at` computed
+/// precomputed once at program start (`static`, not `const` — a `const` is
+/// a value that may be re-materialized at every use site; `HFD_R2` is one
+/// 4.9 KB table at one fixed address, computed once by `build_hfd_r2_table`
+/// and shared, fix round 1 I5). Both radius tests in `hfd_at` computed
 /// `((dx * dx + dy * dy) as f32).sqrt()` — `i32` multiply/add, THEN cast to
 /// `f32`, THEN `sqrt` — and compared the sqrt against a non-squared radius
 /// (`rs`/`rs+annulus_w`, or `r_ap`/`r_ap+1`); this table caches exactly the
@@ -345,7 +348,7 @@ const fn build_hfd_r2_table() -> [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM] {
     }
     t
 }
-const HFD_R2: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM] = build_hfd_r2_table();
+static HFD_R2: [[f32; HFD_SCRATCH_DIM]; HFD_SCRATCH_DIM] = build_hfd_r2_table();
 
 #[inline]
 fn hfd_r2(dx: i32, dy: i32) -> f32 {

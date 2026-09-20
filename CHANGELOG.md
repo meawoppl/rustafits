@@ -5,6 +5,85 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-09-20
+
+Fifteen commits since 1.2.0, from three cycles of the stacking work in the
+host application: the M4a quality round (detection levels, the XISF reader),
+the full-resolution debayer option, and two performance tiers on the analysis
+kernels. Minor, not patch: the crate gains public API. One feature-gated struct
+is marked `#[non_exhaustive]` — see **Changed** for why that is not a major.
+
+### Added
+
+- **`DetectionLevels` and `ImageAnalyzer::with_detection_levels`.** The fast
+  detector used to pick its two ladder levels from a bright-pixel rank budget
+  derived from `max_stars` — blind to sky brightness — and then descended
+  through a fixed 30-σ arm and a per-tile adaptive pass until the cap was
+  reached, so a caller that wanted a threshold-defined population had no way to
+  ask for one. `DetectionLevels::NoiseRelative { k1, k2 }` puts the two levels
+  at `background + k·noise` and runs only those two arms; `DetectionLevels::
+  Absolute` takes the two levels verbatim in ADU above background, for a caller
+  that pre-filters the image and must keep the threshold still while the filter
+  reshapes the population. `RankBudget` stays the default and reproduces the
+  previous behaviour exactly.
+- **`ProcessConfig.vng_debayer` / `ImageConverter::with_vng_debayer`** route a
+  CFA frame through the gradient debayer (`processing::vng`) instead of the
+  super-pixel one, keeping the native pixel grid. Off by default; the two
+  debayers reduce differently (super-pixel *is* a 2× downscale), and the new
+  path applies the whole `downscale_factor` rather than inheriting the `/2`
+  compensation.
+- **`LmResult::iters`** (under `debug-pipeline`): the Levenberg–Marquardt
+  solvers report their iteration count, so a caller can pin that an arithmetic
+  change left the control flow untouched.
+
+### Changed
+
+- **`LmResult` is `#[non_exhaustive]`** (under `debug-pipeline`). It is a
+  solver *result*: nothing outside the crate has a reason to construct one, and
+  every in-tree destructure already uses `..`. The attribute lets the solvers
+  grow report fields without a major bump each time. If you destructure it
+  exhaustively, add `..`.
+- **XISF float samples keep the u16-domain convention on purpose.** The reader
+  briefly stopped scaling Float32/Float64 samples by 65 535 (the render pipeline
+  is provably invariant to a uniform rescale), then restored it: other consumers
+  of this reader spill the samples into ADU-domain scratch and hand them to
+  ADU-domain detectors. The convention is now a documented cross-crate contract
+  rather than an accident.
+
+### Fixed
+
+- **XISF: the largest `<Image>` wins, `byteOrder="big"` and `bounds="lo:hi"` are
+  honoured, and an un-parsable `<Image>` candidate no longer fails the whole
+  read.** A master written by an external tool carries a same-size weight map
+  after the data; the reader used to take the first image it saw. The
+  multi-image scan introduced a regression — a parse error in any candidate
+  failed the read — which is closed with fixture tests; Float64 samples keep
+  f64 arithmetic until the final cast.
+
+### Performance
+
+All bit-identical to the previous code unless stated; measured on real
+26-megapixel frames on a 10-core machine.
+
+- **The adaptive detector takes the caller's background/noise pair** instead of
+  recomputing it, skips the dead noise-map interpolation, and borrows a
+  single-channel luminance rather than copying it (detect −15…−18 ms per plane,
+  background −40 ms).
+- **`estimate_noise_mrs`** runs on ping-pong buffers (peak residency unchanged
+  — the à-trous layers are the floor — but no per-layer allocation).
+- **HFD measurement** (`hfd_at`) uses a single-copy scratch window with an
+  interior fast path, a static r² table and selection-based medians; the
+  histograms are built in parallel. Detection on a 6224×4168 frame −45 %.
+- **The Moffat solver does one transcendental per sample-iteration**:
+  `base^-β` is evaluated once and its derivative is `−β·power/base`; `powi`
+  replaces `powf` when β is integral; the residual vector is reused from the
+  last accepted Jacobian pass; the Cholesky solve runs on a thread-local
+  scratch. Control flow untouched — over 180 solves (36 stamps × fixed
+  β 2.5/4/6/10 + free β) the iteration count and convergence verdict are
+  identical, positions move ≤ 7e-15 px and fluxes ≤ 2e-14 relative — while a
+  fit takes 30–35 % less time. A `debug_assert` pins the one contract the reuse
+  relies on (`params[7]` equals the fixed β).
+
 ## [1.2.0] — 2026-09-06
 
 ### Added

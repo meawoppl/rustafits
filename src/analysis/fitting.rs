@@ -11,7 +11,14 @@ pub const CALIBRATION_CONV_TOL: f64 = 1e-6;
 pub const CALIBRATION_MAX_REJECTS: usize = 5;
 
 /// Result from Levenberg-Marquardt solver: convergence flag + final cost.
+///
+/// `#[non_exhaustive]`: this crate is published, and the solvers grow a
+/// reporting field now and then (`iters` arrived with the C3 arithmetic
+/// pins). Downstream code reads the fields and never builds or exhaustively
+/// destructures the struct, so sealing construction costs nothing and keeps
+/// the next field from being a breaking change.
 #[allow(dead_code)]
+#[non_exhaustive]
 pub struct LmResult {
     pub converged: bool,
     pub final_cost: f64,
@@ -684,6 +691,18 @@ fn lm_solve_moffat_with(
     max_rejects: usize,
     scratch: &mut MoffatScratch,
 ) -> LmResult {
+    // The reuse seam's contract: `residual_cost_moffat_into` resolves its
+    // exponent from `params[7]`, while the Jacobian pass below takes
+    // `fixed_beta.unwrap_or(params[7])` — a cached `power` is the value the
+    // Jacobian wants only while those two agree. They do by construction
+    // (`fit_moffat_2d_impl` seeds `params[7] = beta_init = fixed_beta`, and
+    // `np = 7` keeps `delta` from ever reaching index 7), but that is a
+    // cross-function rule, so state it rather than leave it unwritten.
+    debug_assert!(
+        fixed_beta.is_none_or(|b| params[7] == b),
+        "a fixed-beta solve must carry its beta in params[7]: {} != {fixed_beta:?}",
+        params[7]
+    );
     let np = if fixed_beta.is_some() { 7 } else { 8 };
     let n = pixels.len();
     scratch.reserve_exact_len(n);
@@ -1756,6 +1775,12 @@ mod tests {
             }
         }
 
+        // The loop ran: 36 stamps x 5 beta modes. Deliberately NOT an
+        // assertion on how many of them moved — which fits land bit-identical
+        // depends on the host's `powf`/`powi`.
+        assert_eq!(cases, fixtures.len() * modes.len());
+        assert_eq!(cases, 180, "fixture x mode grid");
+
         println!(
             "C3 DELTA over {cases} solves ({identical} bit-identical, \
              {} moved): max |dpos| {max_pos:.3e} px [{worst_pos}], \
@@ -1768,6 +1793,13 @@ mod tests {
     #[test]
     fn c3_cholesky_on_caller_scratch_is_bit_identical() {
         let mut rng = Lcg(0xC401_0C8E_5017_0000);
+        // Hoisted, and poisoned up front: the solver is only ever handed
+        // scratch that a previous solve (of some other `np`) left dirty, so
+        // the pin must exercise that — every element it reads has to be one
+        // it wrote in THIS call. A NaN survivor would show up as a mismatch.
+        let mut l = [f64::NAN; MAX_LM_PARAMS * MAX_LM_PARAMS];
+        let mut y = [f64::NAN; MAX_LM_PARAMS];
+        let mut got = [f64::NAN; MAX_LM_PARAMS];
         for np in 2..=MAX_LM_PARAMS {
             for _ in 0..64 {
                 // A random SPD matrix: M = R·Rᵀ + n·I.
@@ -1786,9 +1818,6 @@ mod tests {
 
                 let want =
                     reference::cholesky_solve_alloc(&mat, &rhs, np).expect("SPD system must solve");
-                let mut l = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
-                let mut y = [0.0_f64; MAX_LM_PARAMS];
-                let mut got = [0.0_f64; MAX_LM_PARAMS];
                 assert!(cholesky_solve_into(
                     &mat, &rhs, np, &mut l, &mut y, &mut got
                 ));
@@ -1800,11 +1829,14 @@ mod tests {
     #[test]
     fn c3_integral_exponent_matches_powf_to_a_few_ulp() {
         let mut worst = 0.0_f64;
-        for beta in [2.0_f64, 3.0, 4.0, 6.0, 10.0] {
+        // 20 is the free-beta clamp's ceiling and so is reachable; the base
+        // runs past the far corner of the widest stamp the fitter builds
+        // (radius 48, alpha at its 0.3 floor: 1 + Q reaches ~2.6e4).
+        for beta in [2.0_f64, 3.0, 4.0, 6.0, 10.0, 20.0] {
             let e = MoffatExponent::new(beta);
             assert!(matches!(e, MoffatExponent::Integral(_)), "beta {beta}");
             let mut base = 1.0_f64;
-            while base < 5_000.0 {
+            while base < 40_000.0 {
                 let got = e.eval(base);
                 let want = base.powf(-beta);
                 if want > 0.0 {
@@ -1818,9 +1850,15 @@ mod tests {
         assert!(worst < 1e-14, "integral exponent deviation {worst:.3e}");
         println!("C3 powi vs powf: max relative deviation {worst:.3e}");
 
-        // 2.5 is an `AUTO_BETAS` member and must stay on the real path.
+        // 2.5 is an `AUTO_BETAS` member and must stay on the real path; so
+        // must anything outside the 1..=20 window, clamp ceiling included.
         assert!(matches!(MoffatExponent::new(2.5), MoffatExponent::Real(_)));
         assert!(matches!(MoffatExponent::new(0.0), MoffatExponent::Real(_)));
+        assert!(matches!(MoffatExponent::new(21.0), MoffatExponent::Real(_)));
         assert!(matches!(MoffatExponent::new(25.0), MoffatExponent::Real(_)));
+        assert!(matches!(
+            MoffatExponent::new(f64::NAN),
+            MoffatExponent::Real(_)
+        ));
     }
 }
